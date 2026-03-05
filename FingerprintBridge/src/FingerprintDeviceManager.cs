@@ -14,20 +14,22 @@ namespace FingerprintBridge
     /// <summary>
     /// Multi-reader DigitalPersona fingerprint manager.
     ///
-    /// Architecture:
-    ///   Start() must be called from the main UI thread (the one running
-    ///   Application.Run).  ALL SDK calls happen on that thread via its
-    ///   existing message pump — no separate threads needed.
+    /// Architecture (learned from official SDK sample):
     ///
-    ///   CaptureAsync arms the reader; the SDK posts a message to the UI
-    ///   thread's queue; Application.Run dispatches it → On_Captured fires
-    ///   on the UI thread → we process the image and re-arm.
+    ///   CaptureAsync arms the reader.  The On_Captured callback fires on a
+    ///   NATIVE BACKGROUND THREAD managed by the SDK — no message pump or
+    ///   SynchronizationContext is required.  (The official sample proves this
+    ///   by using InvokeRequired/Invoke inside its OnCaptured handler.)
     ///
-    ///   A WinForms Timer polls for new/removed readers every 2 seconds,
-    ///   also on the UI thread.
+    ///   Before each CaptureAsync call we MUST call Reader.GetStatus() to
+    ///   verify the reader is ready (and calibrate if needed).  The official
+    ///   sample does this every time.
     ///
-    ///   Cross-thread calls (from WebSocket handlers) are marshalled to
-    ///   the UI thread via the captured SynchronizationContext.
+    ///   After Open() we call SetPAD(true) to match the official sample.
+    ///
+    ///   A WinForms Timer polls for new/removed readers every 2 seconds
+    ///   on the UI thread.  All other SDK operations (CaptureAsync, GetStatus,
+    ///   the callback) happen on native threads.
     /// </summary>
     public class FingerprintDeviceManager
     {
@@ -38,13 +40,12 @@ namespace FingerprintBridge
             public required string DeviceId;
             public required string DeviceName;
             public int Resolution;
-            public bool CaptureArmed;
+            public volatile bool CaptureArmed;
         }
 
         // ── Fields ──────────────────────────────────────────────────────
         private readonly ConcurrentDictionary<string, ReaderState> _activeReaders = new();
         private readonly ConcurrentDictionary<string, DateTime> _openFailCooldowns = new();
-        private SynchronizationContext? _uiContext;
         private System.Windows.Forms.Timer? _pollTimer;
         private volatile bool _stopping;
         private volatile string _captureFormat = "raw";
@@ -67,21 +68,13 @@ namespace FingerprintBridge
 
         /// <summary>
         /// Starts polling for readers and auto-capturing.
-        /// MUST be called from the main UI thread (the one running Application.Run)
-        /// so that CaptureAsync callbacks are dispatched by the main message pump.
+        /// Call from the UI thread so the WinForms Timer ticks properly.
         /// </summary>
         public void Start(CancellationToken ct)
         {
             _stopping = false;
 
-            _uiContext = SynchronizationContext.Current;
-            var threadState = Thread.CurrentThread.GetApartmentState();
-            Logger.Info($"FingerprintDeviceManager.Start() on thread={Thread.CurrentThread.ManagedThreadId}, STA={threadState}, SyncCtx={_uiContext?.GetType().Name ?? "null"}");
-
-            if (_uiContext == null)
-            {
-                Logger.Warn("No SynchronizationContext — On_Captured callbacks may not fire. Ensure Start() is called from the UI thread.");
-            }
+            Logger.Info($"FingerprintDeviceManager.Start() on thread={Thread.CurrentThread.ManagedThreadId}");
 
             // WinForms Timer — Tick fires on the UI thread's message loop
             _pollTimer = new System.Windows.Forms.Timer { Interval = 2000 };
@@ -96,26 +89,14 @@ namespace FingerprintBridge
 
         /// <summary>
         /// Stops all capture, disposes all readers.
-        /// Safe to call from any thread — will marshal to UI thread if needed.
         /// </summary>
         public void Stop()
         {
             if (_stopping) return;
             _stopping = true;
 
-            // If we're on the UI thread, stop directly. Otherwise marshal.
-            if (_uiContext != null && SynchronizationContext.Current != _uiContext)
-            {
-                _uiContext.Send(_ => StopInternal(), null);
-            }
-            else
-            {
-                StopInternal();
-            }
-        }
+            Logger.Info("Stopping fingerprint device manager...");
 
-        private void StopInternal()
-        {
             _pollTimer?.Stop();
             _pollTimer?.Dispose();
             _pollTimer = null;
@@ -123,6 +104,13 @@ namespace FingerprintBridge
             foreach (var kv in _activeReaders)
             {
                 try { kv.Value.Reader.CancelCapture(); } catch { }
+            }
+
+            // Give callbacks a moment to finish after CancelCapture
+            Thread.Sleep(100);
+
+            foreach (var kv in _activeReaders)
+            {
                 try { kv.Value.Reader.Dispose(); } catch { }
             }
 
@@ -160,21 +148,9 @@ namespace FingerprintBridge
             };
         }
 
-        /// <summary>
-        /// Returns all readers the SDK can see.
-        /// Marshals to UI thread for the SDK call.
-        /// </summary>
         public Protocol.DeviceInfo[] GetDevices()
         {
-            if (_uiContext == null)
-                return GetDevicesInternal();
-
-            Protocol.DeviceInfo[]? result = null;
-            _uiContext.Send(_ =>
-            {
-                result = GetDevicesInternal();
-            }, null);
-            return result ?? Array.Empty<Protocol.DeviceInfo>();
+            return GetDevicesInternal();
         }
 
         private Protocol.DeviceInfo[] GetDevicesInternal()
@@ -256,12 +232,8 @@ namespace FingerprintBridge
                 {
                     Logger.Info($"Opening reader: {deviceName} ({deviceId})...");
 
+                    // Official sample uses ONLY DP_PRIORITY_COOPERATIVE
                     var result = reader.Open(Constants.CapturePriority.DP_PRIORITY_COOPERATIVE);
-                    if (result != Constants.ResultCode.DP_SUCCESS)
-                    {
-                        Logger.Warn($"Cooperative open failed ({result}), trying exclusive...");
-                        result = reader.Open(Constants.CapturePriority.DP_PRIORITY_EXCLUSIVE);
-                    }
 
                     if (result != Constants.ResultCode.DP_SUCCESS)
                     {
@@ -273,7 +245,18 @@ namespace FingerprintBridge
 
                     _openFailCooldowns.TryRemove(deviceId, out _);
 
-                    // Cache resolution — we're on the UI thread, safe to access Capabilities
+                    // Official sample: SetPAD(true) right after Open
+                    try
+                    {
+                        var padResult = reader.SetPAD(true);
+                        Logger.Info($"[{deviceId}] SetPAD(true) result: {padResult}");
+                    }
+                    catch (Exception padEx)
+                    {
+                        Logger.Warn($"[{deviceId}] SetPAD failed (non-fatal): {padEx.Message}");
+                    }
+
+                    // Cache resolution
                     int resolution = 0;
                     try
                     {
@@ -307,7 +290,7 @@ namespace FingerprintBridge
                     }
 
                     // Subscribe to capture callback ONCE per reader.
-                    // The callback fires on the UI thread via the main message pump.
+                    // Callback fires on a NATIVE BACKGROUND THREAD (not the UI thread).
                     reader.On_Captured += new Reader.CaptureCallback(
                         captureResult => HandleCaptured(state, captureResult)
                     );
@@ -315,7 +298,7 @@ namespace FingerprintBridge
                     Logger.Info($"Reader opened: {deviceName} (ID: {deviceId}, res: {resolution})");
                     OnDeviceConnected?.Invoke(deviceId, deviceName);
 
-                    // Arm async capture
+                    // Check status + arm async capture
                     ArmCapture(state);
                 }
                 catch (Exception ex)
@@ -327,12 +310,70 @@ namespace FingerprintBridge
         }
 
         // ═══════════════════════════════════════════════════════════════
-        //  Async capture  (runs on UI thread)
+        //  Reader status check  (from official SDK sample pattern)
         // ═══════════════════════════════════════════════════════════════
 
         /// <summary>
-        /// Arms CaptureAsync on the reader. When a finger is placed, the SDK
-        /// posts a message and On_Captured fires on the UI thread.
+        /// Checks reader status before capture — mirrors the official SDK sample's
+        /// GetStatus() method. Handles calibration, busy state, etc.
+        /// Returns true if reader is ready to capture.
+        /// </summary>
+        private bool CheckReaderStatus(ReaderState state)
+        {
+            try
+            {
+                var result = state.Reader.GetStatus();
+
+                if (result != Constants.ResultCode.DP_SUCCESS)
+                {
+                    Logger.Error($"[{state.DeviceId}] GetStatus() returned: {result}");
+                    return false;
+                }
+
+                var status = state.Reader.Status.Status;
+                Logger.Debug($"[{state.DeviceId}] Reader status: {status}");
+
+                if (status == Constants.ReaderStatuses.DP_STATUS_BUSY)
+                {
+                    // Official sample: just sleep and continue
+                    Logger.Info($"[{state.DeviceId}] Reader busy, waiting 50ms...");
+                    Thread.Sleep(50);
+                    return true; // Try anyway after wait
+                }
+                else if (status == Constants.ReaderStatuses.DP_STATUS_NEED_CALIBRATION)
+                {
+                    Logger.Info($"[{state.DeviceId}] Reader needs calibration, calibrating...");
+                    state.Reader.Calibrate();
+                    return true;
+                }
+                else if (status == Constants.ReaderStatuses.DP_STATUS_READY)
+                {
+                    return true;
+                }
+                else
+                {
+                    // For any other status, log it but try anyway
+                    Logger.Warn($"[{state.DeviceId}] Unexpected reader status: {status}, attempting capture anyway");
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"[{state.DeviceId}] CheckReaderStatus exception: {ex.Message}");
+                return false;
+            }
+        }
+
+        // ═══════════════════════════════════════════════════════════════
+        //  Async capture
+        // ═══════════════════════════════════════════════════════════════
+
+        /// <summary>
+        /// Arms CaptureAsync on the reader, following the official SDK sample pattern:
+        ///   1. Call GetStatus() to verify reader is ready (calibrate if needed)
+        ///   2. Call CaptureAsync(format, processing, resolution)
+        ///
+        /// When a finger is placed, On_Captured fires on a native background thread.
         /// SDK signature: CaptureAsync(format, processing, resolution) — no timeout.
         /// </summary>
         private void ArmCapture(ReaderState state)
@@ -341,7 +382,16 @@ namespace FingerprintBridge
 
             try
             {
-                Logger.Info($"[{state.DeviceId}] Arming CaptureAsync on thread={Thread.CurrentThread.ManagedThreadId}...");
+                // ── Step 1: Check reader status (official sample pattern) ──
+                if (!CheckReaderStatus(state))
+                {
+                    Logger.Warn($"[{state.DeviceId}] Reader not ready, will retry on next poll");
+                    state.CaptureArmed = false;
+                    return;
+                }
+
+                // ── Step 2: Arm CaptureAsync ──
+                Logger.Info($"[{state.DeviceId}] Arming CaptureAsync (thread={Thread.CurrentThread.ManagedThreadId})...");
 
                 var armResult = state.Reader.CaptureAsync(
                     Constants.Formats.Fid.ANSI,
@@ -361,7 +411,7 @@ namespace FingerprintBridge
             }
             catch (Exception ex)
             {
-                Logger.Error($"[{state.DeviceId}] CaptureAsync threw: {ex.GetType().Name}: {ex.Message}");
+                Logger.Error($"[{state.DeviceId}] ArmCapture threw: {ex.GetType().Name}: {ex.Message}");
                 state.CaptureArmed = false;
 
                 if (IsDeviceGoneException(ex))
@@ -372,9 +422,9 @@ namespace FingerprintBridge
         }
 
         /// <summary>
-        /// Callback fired by the SDK on the UI thread when a fingerprint
-        /// image (or error) is available. Processes the result, fires events,
-        /// and re-arms CaptureAsync for the next finger.
+        /// Callback fired by the SDK on a NATIVE BACKGROUND THREAD when a
+        /// fingerprint image (or error) is available.
+        /// Processes the result, fires events, and re-arms CaptureAsync.
         /// </summary>
         private void HandleCaptured(ReaderState state, CaptureResult captureResult)
         {
@@ -386,7 +436,7 @@ namespace FingerprintBridge
 
             try
             {
-                Logger.Info($"[{deviceId}] On_Captured: Code={captureResult.ResultCode}, Quality={captureResult.Quality}");
+                Logger.Info($"[{deviceId}] On_Captured fired! Thread={Thread.CurrentThread.ManagedThreadId}, Code={captureResult.ResultCode}, Quality={captureResult.Quality}");
 
                 // ── Device failure — reader likely unplugged ──
                 if (captureResult.ResultCode == Constants.ResultCode.DP_DEVICE_FAILURE ||
@@ -473,6 +523,7 @@ namespace FingerprintBridge
             _activeReaders.TryRemove(deviceId, out _);
             _openFailCooldowns[deviceId] = DateTime.UtcNow + OpenFailCooldown;
 
+            try { state.Reader.CancelCapture(); } catch { }
             try { state.Reader.Dispose(); }
             catch (Exception ex)
             {
