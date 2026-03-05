@@ -293,29 +293,13 @@ namespace FingerprintBridge
         /// </summary>
         private void CaptureLoop(string format, int timeout, CancellationToken ct)
         {
+            Logger.Info($"CaptureLoop entered — format={format}, timeout={timeout}");
+
             while (!ct.IsCancellationRequested && _isCapturing && _currentReader != null)
             {
                 try
                 {
-                    // Check reader status before capture
-                    var statusResult = _currentReader.GetStatus();
-                    if (statusResult != Constants.ResultCode.DP_SUCCESS)
-                    {
-                        Logger.Warn($"GetStatus failed: {statusResult}. Waiting...");
-                        Thread.Sleep(500);
-                        continue;
-                    }
-                    var readerStatus = _currentReader.Status.Status;
-                    if (readerStatus == Constants.ReaderStatuses.DP_STATUS_BUSY ||
-                        readerStatus == Constants.ReaderStatuses.DP_STATUS_FAILURE ||
-                        readerStatus == Constants.ReaderStatuses.DP_STATUS_NEED_CALIBRATION)
-                    {
-                        Logger.Warn($"Reader not ready: {readerStatus}. Waiting...");
-                        Thread.Sleep(500);
-                        continue;
-                    }
-
-                    OnReaderReady?.Invoke();
+                    Logger.Debug("CaptureLoop: calling Capture()...");
 
                     // Determine FID format based on requested format
                     var fidFormat = Constants.Formats.Fid.ANSI;
@@ -324,7 +308,6 @@ namespace FingerprintBridge
                     int captureTimeout = timeout > 0 ? timeout : -1;
 
                     // This is the blocking call - waits for a finger to be placed
-                    // Signature: Capture(Fid.Format, CaptureProcessing, timeout_ms, resolution)
                     CaptureResult captureResult = _currentReader.Capture(
                         fidFormat,
                         Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
@@ -332,23 +315,31 @@ namespace FingerprintBridge
                         _currentReader.Capabilities.Resolutions[0]
                     );
 
+                    Logger.Debug("CaptureLoop: Capture() returned");
+
                     if (ct.IsCancellationRequested || !_isCapturing)
+                    {
+                        Logger.Debug("CaptureLoop: cancelled after Capture()");
                         break;
+                    }
 
                     if (captureResult == null)
                     {
-                        Logger.Warn("Capture returned null");
+                        Logger.Warn("CaptureLoop: captureResult is null");
                         continue;
                     }
 
+                    Logger.Info($"CaptureLoop: ResultCode={captureResult.ResultCode}, Quality={captureResult.Quality}, Score={captureResult.Score}");
+
                     if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
                     {
-                        Logger.Debug("Capture was cancelled");
+                        Logger.Debug("CaptureLoop: quality=CANCELED, breaking");
                         break;
                     }
 
                     if (captureResult.ResultCode != Constants.ResultCode.DP_SUCCESS)
                     {
+                        Logger.Warn($"CaptureLoop: non-success ResultCode={captureResult.ResultCode}");
                         OnCaptureFailed?.Invoke(
                             captureResult.ResultCode.ToString(),
                             $"Capture failed: {captureResult.ResultCode}"
@@ -357,8 +348,15 @@ namespace FingerprintBridge
                         continue;
                     }
 
+                    Logger.Debug($"CaptureLoop: Data null? {captureResult.Data == null}");
+                    if (captureResult.Data != null)
+                    {
+                        Logger.Debug($"CaptureLoop: Views.Count={captureResult.Data.Views.Count}");
+                    }
+
                     if (captureResult.Data == null || captureResult.Data.Views.Count == 0)
                     {
+                        Logger.Warn("CaptureLoop: no image data in result");
                         OnCaptureFailed?.Invoke("no_data", "Capture returned no image data");
                         continue;
                     }
@@ -369,54 +367,47 @@ namespace FingerprintBridge
                     var view = captureResult.Data.Views[0];
                     int width = view.Width;
                     int height = view.Height;
-                    // Resolution from the capture capabilities (DPI)
                     int resolution = _currentReader.Capabilities.Resolutions[0];
 
+                    Logger.Info($"CaptureLoop: image {width}x{height} @ {resolution}dpi, RawImage.Length={view.RawImage?.Length ?? 0}");
+
                     // Calculate NFIQ quality score (1=best, 5=unusable)
-                    int quality = 5; // Worst by default
-                    try
-                    {
-                        // Use captureResult.Quality if available from the SDK
-                        if (captureResult.Quality != Constants.CaptureQuality.DP_QUALITY_CANCELED)
-                        {
-                            // Map SDK quality enum to a 1-5 scale
-                            quality = MapCaptureQuality(captureResult.Quality);
-                        }
-                    }
-                    catch (Exception ex)
-                    {
-                        Logger.Warn($"Quality assessment failed: {ex.Message}");
-                    }
+                    int quality = MapCaptureQuality(captureResult.Quality);
 
                     // Encode the image
                     string imageBase64;
                     if (format == "png")
                     {
+                        Logger.Debug("CaptureLoop: converting to PNG...");
                         imageBase64 = ConvertRawToPngBase64(view.RawImage, width, height);
                     }
                     else
                     {
-                        // Send raw grayscale bytes
+                        Logger.Debug("CaptureLoop: encoding raw to base64...");
                         imageBase64 = Convert.ToBase64String(view.RawImage);
                     }
+
+                    Logger.Info($"CaptureLoop: base64 length={imageBase64.Length}, quality={quality}");
 
                     OnCaptureCompleted?.Invoke(imageBase64, quality, width, height, resolution);
                     OnFingerRemoved?.Invoke();
 
-                    // Brief pause before re-arming capture
+                    Logger.Debug("CaptureLoop: events fired, re-arming...");
                     Thread.Sleep(100);
                 }
                 catch (OperationCanceledException)
                 {
+                    Logger.Debug("CaptureLoop: OperationCanceledException");
                     break;
                 }
                 catch (Exception ex)
                 {
                     if (!ct.IsCancellationRequested)
                     {
-                        Logger.Error($"Capture loop error: {ex.Message}");
+                        Logger.Error($"CaptureLoop EXCEPTION: {ex.GetType().Name}: {ex.Message}");
+                        Logger.Error($"CaptureLoop stack: {ex.StackTrace}");
                         OnCaptureFailed?.Invoke("capture_exception", ex.Message);
-                        Thread.Sleep(1000); // Backoff on error
+                        Thread.Sleep(1000);
                     }
                 }
             }
