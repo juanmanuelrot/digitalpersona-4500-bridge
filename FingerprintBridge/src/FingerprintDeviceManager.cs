@@ -40,9 +40,11 @@ namespace FingerprintBridge
 
         // ── Fields ──────────────────────────────────────────────────────
         private readonly ConcurrentDictionary<string, ReaderState> _activeReaders = new();
+        private readonly ConcurrentDictionary<string, DateTime> _openFailCooldowns = new();
         private readonly object _sdkLock = new();
         private CancellationTokenSource? _masterCts;
         private string _captureFormat = "raw";
+        private static readonly TimeSpan OpenFailCooldown = TimeSpan.FromSeconds(10);
 
         // ── Events ──────────────────────────────────────────────────────
         public event Action<string, string>? OnDeviceConnected;               // (deviceId, deviceName)
@@ -104,6 +106,7 @@ namespace FingerprintBridge
             }
 
             _activeReaders.Clear();
+            _openFailCooldowns.Clear();
             Logger.Info("All readers stopped and closed");
         }
 
@@ -233,6 +236,11 @@ namespace FingerprintBridge
                     if (_activeReaders.ContainsKey(deviceId))
                         continue;
 
+                    // Cooldown: skip readers that recently failed to open
+                    if (_openFailCooldowns.TryGetValue(deviceId, out var cooldownUntil)
+                        && DateTime.UtcNow < cooldownUntil)
+                        continue;
+
                     // Try to open
                     try
                     {
@@ -248,9 +256,13 @@ namespace FingerprintBridge
                         if (result != Constants.ResultCode.DP_SUCCESS)
                         {
                             Logger.Error($"Failed to open reader {deviceId}: {result}");
+                            _openFailCooldowns[deviceId] = DateTime.UtcNow + OpenFailCooldown;
                             OnError?.Invoke("open_failed", $"Could not open reader {deviceName}: {result}");
                             continue;
                         }
+
+                        // Opened successfully — clear any previous cooldown
+                        _openFailCooldowns.TryRemove(deviceId, out _);
 
                         // Cache resolution now (inside _sdkLock) so capture thread never
                         // touches Capabilities — avoids cross-thread SDK access.
@@ -338,13 +350,14 @@ namespace FingerprintBridge
 
                         // ── Blocking call — NO lock held ──
                         // Uses cached resolution from Open() — never touches Capabilities here.
-                        // Timeout = 5 seconds; loop retries until finger placed or cancelled.
-                        // (-1 causes DP_INVALID_PARAMETER on some SDK builds.)
+                        // SDK signature: Capture(format, processing, timeout, resolution)
+                        //   timeout  = -1 means block indefinitely until finger or CancelCapture()
+                        //   resolution = cached DPI from reader capabilities (typically 500)
                         captureResult = state.Reader.Capture(
                             Constants.Formats.Fid.ANSI,
                             Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
-                            state.Resolution,
-                            5000  // 5-second timeout, loop retries
+                            -1,               // timeout: infinite — loop exits via CancelCapture() or error
+                            state.Resolution  // resolution: 500 DPI (cached from Open)
                         );
                     }
                     catch (ObjectDisposedException)
@@ -495,6 +508,8 @@ namespace FingerprintBridge
         /// <summary>
         /// Removes the reader from tracking, disposes it under _sdkLock,
         /// and fires OnDeviceDisconnected. Safe to call from any thread.
+        /// Sets a cooldown so the poll thread doesn't immediately re-open
+        /// a reader that just failed.
         /// </summary>
         private void CleanupReader(ReaderState state)
         {
@@ -502,6 +517,9 @@ namespace FingerprintBridge
 
             // Remove from dictionary first (so poll thread doesn't see it as active)
             _activeReaders.TryRemove(deviceId, out _);
+
+            // Cooldown: give SDK and hardware time to recover before re-open
+            _openFailCooldowns[deviceId] = DateTime.UtcNow + OpenFailCooldown;
 
             // Dispose under SDK lock
             lock (_sdkLock)
