@@ -21,7 +21,7 @@
 
   <ItemGroup>
     <!-- DigitalPersona .NET 8 SDK wrapper (managed) -->
-    <Reference Include="DPUruNet">
+    <Reference Include="DPUruNet_DotNet8">
       <HintPath>lib\DPUruNet.dll</HintPath>
       <Private>true</Private>
     </Reference>
