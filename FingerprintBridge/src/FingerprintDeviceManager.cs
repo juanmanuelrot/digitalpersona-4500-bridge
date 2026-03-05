@@ -32,6 +32,7 @@ namespace FingerprintBridge
             public required Reader Reader;
             public required string DeviceId;
             public required string DeviceName;
+            public int Resolution;  // Cached during Open() inside _sdkLock
             public Thread? CaptureThread;
             public CancellationTokenSource? CaptureCts;
             public volatile bool Capturing;
@@ -251,11 +252,32 @@ namespace FingerprintBridge
                             continue;
                         }
 
+                        // Cache resolution now (inside _sdkLock) so capture thread never
+                        // touches Capabilities — avoids cross-thread SDK access.
+                        int resolution = 0;
+                        try
+                        {
+                            var caps = reader.Capabilities;
+                            if (caps?.Resolutions != null && caps.Resolutions.Length > 0)
+                                resolution = caps.Resolutions[0];
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn($"Could not read capabilities for {deviceId}: {ex.Message}");
+                        }
+
+                        if (resolution == 0)
+                        {
+                            resolution = 500; // Default DPI for DP 4500
+                            Logger.Info($"Using default resolution {resolution} for {deviceId}");
+                        }
+
                         var state = new ReaderState
                         {
                             Reader = reader,
                             DeviceId = deviceId,
-                            DeviceName = deviceName
+                            DeviceName = deviceName,
+                            Resolution = resolution
                         };
 
                         if (!_activeReaders.TryAdd(deviceId, state))
@@ -301,6 +323,9 @@ namespace FingerprintBridge
             Logger.Info($"[{deviceId}] Capture loop started for {deviceName}");
             state.Capturing = true;
 
+            int consecutiveErrors = 0;
+            const int MAX_CONSECUTIVE_ERRORS = 5;
+
             try
             {
                 while (!ct.IsCancellationRequested)
@@ -309,32 +334,38 @@ namespace FingerprintBridge
 
                     try
                     {
-                        Logger.Debug($"[{deviceId}] Waiting for finger...");
+                        Logger.Debug($"[{deviceId}] Waiting for finger (res={state.Resolution})...");
 
                         // ── Blocking call — NO lock held ──
+                        // Uses cached resolution from Open() — never touches Capabilities here.
                         captureResult = state.Reader.Capture(
                             Constants.Formats.Fid.ANSI,
                             Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
-                            state.Reader.Capabilities.Resolutions[0],
+                            state.Resolution,
                             -1  // infinite timeout
                         );
                     }
                     catch (ObjectDisposedException)
                     {
-                        // Reader was disposed (USB unplug or Stop())
                         Logger.Warn($"[{deviceId}] Reader disposed during capture");
                         break;
                     }
                     catch (Exception ex)
                     {
-                        // Catch-all for unexpected SDK errors during capture
                         Logger.Error($"[{deviceId}] Capture() threw: {ex.GetType().Name}: {ex.Message}");
 
                         if (IsDeviceGoneException(ex))
                             break;
 
+                        consecutiveErrors++;
+                        if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS)
+                        {
+                            Logger.Error($"[{deviceId}] Too many consecutive errors ({consecutiveErrors}), giving up");
+                            break;
+                        }
+
                         OnCaptureFailed?.Invoke(deviceId, "capture_exception", ex.Message);
-                        Thread.Sleep(200); // Avoid tight error loops
+                        Thread.Sleep(500);
                         continue;
                     }
 
@@ -346,12 +377,7 @@ namespace FingerprintBridge
                     {
                         Logger.Info($"[{deviceId}] Capture: Code={captureResult.ResultCode}, Quality={captureResult.Quality}");
 
-                        // Cancelled (CancelCapture was called)
-                        if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
-                        {
-                            Logger.Info($"[{deviceId}] Capture cancelled");
-                            break;
-                        }
+                        // ── Check ResultCode FIRST (before Quality) ──
 
                         // Device failure — reader likely unplugged
                         if (captureResult.ResultCode == Constants.ResultCode.DP_DEVICE_FAILURE ||
@@ -361,7 +387,41 @@ namespace FingerprintBridge
                             break;
                         }
 
-                        // Non-success (bad scan quality, etc.)
+                        // Invalid parameter — bad Capture() args, retry won't help
+                        if (captureResult.ResultCode == Constants.ResultCode.DP_INVALID_PARAMETER)
+                        {
+                            consecutiveErrors++;
+                            Logger.Error($"[{deviceId}] DP_INVALID_PARAMETER (attempt {consecutiveErrors}/{MAX_CONSECUTIVE_ERRORS})");
+
+                            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS)
+                            {
+                                Logger.Error($"[{deviceId}] Persistent DP_INVALID_PARAMETER, closing reader");
+                                break;
+                            }
+
+                            Thread.Sleep(1000);
+                            continue;
+                        }
+
+                        // ── Now check Quality ──
+
+                        // Cancelled ONLY when WE called CancelCapture (via Stop/cleanup).
+                        // Only break if token is also cancelled, otherwise it's spurious.
+                        if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
+                        {
+                            if (ct.IsCancellationRequested)
+                            {
+                                Logger.Info($"[{deviceId}] Capture cancelled (shutdown)");
+                                break;
+                            }
+
+                            // Spurious cancel — retry
+                            Logger.Warn($"[{deviceId}] Spurious cancel, retrying...");
+                            Thread.Sleep(200);
+                            continue;
+                        }
+
+                        // Other non-success (bad scan, etc.)
                         if (captureResult.ResultCode != Constants.ResultCode.DP_SUCCESS)
                         {
                             Logger.Warn($"[{deviceId}] Capture non-success: {captureResult.ResultCode}");
@@ -383,14 +443,15 @@ namespace FingerprintBridge
                             continue;
                         }
 
-                        // ════ Successful capture ════
+                        // ════ Successful capture — reset error counter ════
+                        consecutiveErrors = 0;
+
                         var view = captureResult.Data.Views[0];
                         int width = view.Width;
                         int height = view.Height;
-                        int resolution = state.Reader.Capabilities.Resolutions[0];
                         int quality = MapCaptureQuality(captureResult.Quality);
 
-                        Logger.Info($"[{deviceId}] Fingerprint: {width}x{height} @ {resolution}dpi, quality={quality}");
+                        Logger.Info($"[{deviceId}] Fingerprint: {width}x{height} @ {state.Resolution}dpi, quality={quality}");
 
                         string imageBase64;
                         if (_captureFormat == "png")
@@ -402,7 +463,7 @@ namespace FingerprintBridge
                             imageBase64 = Convert.ToBase64String(view.RawImage);
                         }
 
-                        OnCaptureCompleted?.Invoke(deviceId, imageBase64, quality, width, height, resolution);
+                        OnCaptureCompleted?.Invoke(deviceId, imageBase64, quality, width, height, state.Resolution);
                     }
                     catch (Exception ex)
                     {
