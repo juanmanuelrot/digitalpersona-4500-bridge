@@ -6,8 +6,8 @@ namespace FingerprintBridge
 {
     /// <summary>
     /// Core service: wires the fingerprint device manager to the WebSocket server.
-    /// Always captures — every finger press is broadcast to all connected clients.
-    /// Clients can query status and device list.
+    /// All connected readers capture continuously — every finger press is broadcast
+    /// to all connected WebSocket clients with the deviceId that produced it.
     /// </summary>
     public class BridgeService
     {
@@ -27,10 +27,11 @@ namespace FingerprintBridge
             _wsServer = new WebSocketServer(port);
             _deviceManager = new FingerprintDeviceManager();
 
-            // Device events → WebSocket broadcasts (fire-and-forget, thread-safe)
+            // ── Device events → WebSocket broadcasts ──
+
             _deviceManager.OnDeviceConnected += (deviceId, deviceName) =>
             {
-                OnStatusChanged?.Invoke($"Reader connected: {deviceName}");
+                OnStatusChanged?.Invoke($"Reader connected: {deviceName} ({deviceId})");
                 _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "device_connected",
@@ -39,20 +40,22 @@ namespace FingerprintBridge
                 });
             };
 
-            _deviceManager.OnDeviceDisconnected += () =>
+            _deviceManager.OnDeviceDisconnected += (deviceId) =>
             {
-                OnStatusChanged?.Invoke("Reader disconnected");
+                OnStatusChanged?.Invoke($"Reader disconnected: {deviceId}");
                 _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
-                    Event = "device_disconnected"
+                    Event = "device_disconnected",
+                    DeviceId = deviceId
                 });
             };
 
-            _deviceManager.OnCaptureCompleted += (imageBase64, quality, width, height, resolution) =>
+            _deviceManager.OnCaptureCompleted += (deviceId, imageBase64, quality, width, height, resolution) =>
             {
                 _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "capture_completed",
+                    DeviceId = deviceId,
                     ImageData = imageBase64,
                     Quality = quality,
                     ImageWidth = width,
@@ -61,11 +64,12 @@ namespace FingerprintBridge
                 });
             };
 
-            _deviceManager.OnCaptureFailed += (errorCode, errorMessage) =>
+            _deviceManager.OnCaptureFailed += (deviceId, errorCode, errorMessage) =>
             {
                 _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "capture_failed",
+                    DeviceId = deviceId,
                     ErrorCode = errorCode,
                     ErrorMessage = errorMessage
                 });
@@ -82,7 +86,8 @@ namespace FingerprintBridge
                 });
             };
 
-            // Incoming WebSocket commands → device manager
+            // ── Incoming WebSocket commands ──
+
             _wsServer.OnCommandReceived += async (command) =>
             {
                 try
@@ -101,11 +106,6 @@ namespace FingerprintBridge
                                 Event = "device_list",
                                 Devices = devices
                             });
-                            break;
-
-                        case "select_device":
-                            if (command.DeviceId != null)
-                                _deviceManager.SelectDevice(command.DeviceId);
                             break;
 
                         case "set_format":

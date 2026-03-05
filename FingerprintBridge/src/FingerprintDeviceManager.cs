@@ -1,4 +1,6 @@
 using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Imaging;
 using System.IO;
@@ -11,84 +13,151 @@ using DPUruNet;
 namespace FingerprintBridge
 {
     /// <summary>
-    /// Simplified DigitalPersona fingerprint reader manager.
-    /// Auto-connects to the first reader found.
-    /// Auto-captures continuously — every finger press is reported.
-    /// The frontend decides what to do with the data.
+    /// Multi-reader DigitalPersona fingerprint manager.
+    /// Auto-connects to ALL readers found.
+    /// Each reader captures continuously on its own dedicated thread.
+    /// Every finger press is reported with its deviceId so the frontend
+    /// knows which reader produced it.
+    ///
+    /// Thread safety:
+    ///   _sdkLock serialises every fast SDK call (GetReaders, Open, Dispose, Description).
+    ///   Capture() runs lock-free on per-reader threads (it blocks until finger placed).
+    ///   CancelCapture() is the only cross-thread same-reader call — the SDK supports this.
     /// </summary>
     public class FingerprintDeviceManager
     {
-        private ReaderCollection? _readers;
-        private Reader? _currentReader;
-        private CancellationTokenSource? _pollCts;
-        private string? _currentDeviceId;
+        // ── Per-reader state ────────────────────────────────────────────
+        private class ReaderState
+        {
+            public required Reader Reader;
+            public required string DeviceId;
+            public required string DeviceName;
+            public Thread? CaptureThread;
+            public CancellationTokenSource? CaptureCts;
+            public volatile bool Capturing;
+        }
+
+        // ── Fields ──────────────────────────────────────────────────────
+        private readonly ConcurrentDictionary<string, ReaderState> _activeReaders = new();
+        private readonly object _sdkLock = new();
+        private CancellationTokenSource? _masterCts;
         private string _captureFormat = "raw";
-        private volatile bool _capturing;
 
-        // --- Events (always fire, frontend decides what to do) ---
-        public event Action<string, string>? OnDeviceConnected;      // (deviceId, deviceName)
-        public event Action? OnDeviceDisconnected;
-        public event Action<string, int, int, int, int>? OnCaptureCompleted;  // (base64Image, quality, width, height, dpi)
-        public event Action<string, string>? OnCaptureFailed;         // (errorCode, errorMessage)
-        public event Action<string, string>? OnError;                 // (errorCode, errorMessage)
+        // ── Events ──────────────────────────────────────────────────────
+        public event Action<string, string>? OnDeviceConnected;               // (deviceId, deviceName)
+        public event Action<string>? OnDeviceDisconnected;                    // (deviceId)
+        public event Action<string, string, int, int, int, int>? OnCaptureCompleted;  // (deviceId, base64, quality, w, h, dpi)
+        public event Action<string, string, string>? OnCaptureFailed;         // (deviceId, errorCode, errorMessage)
+        public event Action<string, string>? OnError;                         // (errorCode, errorMessage)
 
-        public bool IsConnected => _currentReader != null;
-        public string? CurrentDeviceId => _currentDeviceId;
+        // ── Public properties ───────────────────────────────────────────
+        public bool IsConnected => !_activeReaders.IsEmpty;
+        public int ReaderCount => _activeReaders.Count;
+
+        // ── Lifecycle ───────────────────────────────────────────────────
 
         /// <summary>
-        /// Starts device polling. When a reader is found, it opens it and
-        /// immediately begins continuous async capture.
+        /// Starts the poll thread that scans for readers every 2 seconds.
+        /// Each reader found is opened and gets a dedicated capture thread.
         /// </summary>
         public void Start(CancellationToken ct)
         {
-            _pollCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            Task.Run(() => PollForDevices(_pollCts.Token), _pollCts.Token);
+            _masterCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+            Task.Run(() => PollForDevices(_masterCts.Token), _masterCts.Token);
         }
 
+        /// <summary>
+        /// Stops all capture threads and closes all readers.
+        /// </summary>
         public void Stop()
         {
-            _pollCts?.Cancel();
-            StopCapturing();
-            CloseCurrentReader();
-            try { _readers?.Dispose(); } catch { }
-            _readers = null;
+            _masterCts?.Cancel();
+
+            // Phase 1: Cancel all capture tokens + CancelCapture to unblock Capture()
+            // CancelCapture is safe to call from any thread (SDK-supported).
+            foreach (var kv in _activeReaders)
+            {
+                var state = kv.Value;
+                state.Capturing = false;
+                state.CaptureCts?.Cancel();
+                try { state.Reader.CancelCapture(); } catch { }
+            }
+
+            // Phase 2: Wait for capture threads to finish
+            foreach (var kv in _activeReaders)
+            {
+                var state = kv.Value;
+                if (state.CaptureThread is { IsAlive: true })
+                {
+                    state.CaptureThread.Join(TimeSpan.FromSeconds(3));
+                }
+            }
+
+            // Phase 3: Dispose all readers under SDK lock
+            lock (_sdkLock)
+            {
+                foreach (var kv in _activeReaders)
+                {
+                    try { kv.Value.Reader.Dispose(); } catch { }
+                }
+            }
+
+            _activeReaders.Clear();
+            Logger.Info("All readers stopped and closed");
         }
+
+        // ── Commands ────────────────────────────────────────────────────
 
         public void SetFormat(string format)
         {
             _captureFormat = format == "png" ? "png" : "raw";
+            Logger.Info($"Capture format set to: {_captureFormat}");
         }
 
         public Protocol.OutboundMessage GetStatus()
         {
+            var devices = _activeReaders.Values
+                .Select(s => new Protocol.DeviceInfo
+                {
+                    Id = s.DeviceId,
+                    Name = s.DeviceName
+                })
+                .ToArray();
+
             return new Protocol.OutboundMessage
             {
                 Event = "status",
-                DeviceConnected = IsConnected,
-                Capturing = _capturing,
-                DeviceId = _currentDeviceId
+                DeviceConnected = !_activeReaders.IsEmpty,
+                Capturing = _activeReaders.Values.Any(s => s.Capturing),
+                Devices = devices.Length > 0 ? devices : null
             };
         }
 
+        /// <summary>
+        /// Returns all readers the SDK can see (connected or not yet opened).
+        /// </summary>
         public Protocol.DeviceInfo[] GetDevices()
         {
             try
             {
-                var readers = ReaderCollection.GetReaders();
-                return readers
-                    .Select(r =>
-                    {
-                        var desc = r.Description;
-                        return new Protocol.DeviceInfo
+                lock (_sdkLock)
+                {
+                    var readers = ReaderCollection.GetReaders();
+                    return readers
+                        .Select(r =>
                         {
-                            Id = desc.SerialNumber ?? desc.Name,
-                            Name = desc.Name,
-                            SerialNumber = desc.SerialNumber,
-                            ProductName = desc.Id?.ProductName,
-                            Vendor = desc.Id?.VendorName
-                        };
-                    })
-                    .ToArray();
+                            var desc = r.Description;
+                            return new Protocol.DeviceInfo
+                            {
+                                Id = desc.SerialNumber ?? desc.Name,
+                                Name = desc.Name,
+                                SerialNumber = desc.SerialNumber,
+                                ProductName = desc.Id?.ProductName,
+                                Vendor = desc.Id?.VendorName
+                            };
+                        })
+                        .ToArray();
+                }
             }
             catch (Exception ex)
             {
@@ -97,53 +166,17 @@ namespace FingerprintBridge
             }
         }
 
-        public void SelectDevice(string deviceId)
-        {
-            StopCapturing();
-            CloseCurrentReader();
-
-            try
-            {
-                _readers = ReaderCollection.GetReaders();
-                foreach (var reader in _readers)
-                {
-                    var desc = reader.Description;
-                    var id = desc.SerialNumber ?? desc.Name;
-                    if (id == deviceId || desc.Name == deviceId)
-                    {
-                        OpenAndCapture(reader);
-                        return;
-                    }
-                }
-                OnError?.Invoke("device_not_found", $"Device '{deviceId}' not found");
-            }
-            catch (Exception ex)
-            {
-                OnError?.Invoke("select_failed", ex.Message);
-            }
-        }
-
-        // -------------------------------------------------------------------
-        //  Private
-        // -------------------------------------------------------------------
+        // ── Poll thread ─────────────────────────────────────────────────
 
         private void PollForDevices(CancellationToken ct)
         {
+            Logger.Info("Device poll thread started");
+
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    if (_currentReader == null)
-                    {
-                        // No reader — try to find one
-                        _readers = ReaderCollection.GetReaders();
-                        if (_readers.Count > 0)
-                        {
-                            OpenAndCapture(_readers[0]);
-                        }
-                    }
-                    // When _currentReader != null, we do NOT poll status.
-                    // The async capture callback handles errors/disconnects.
+                    ScanAndOpenNewReaders();
                 }
                 catch (Exception ex)
                 {
@@ -153,183 +186,282 @@ namespace FingerprintBridge
                 try { Thread.Sleep(2000); }
                 catch (OperationCanceledException) { break; }
             }
-        }
 
-        private void OpenAndCapture(Reader reader)
-        {
-            try
-            {
-                var result = reader.Open(Constants.CapturePriority.DP_PRIORITY_COOPERATIVE);
-                if (result != Constants.ResultCode.DP_SUCCESS)
-                {
-                    result = reader.Open(Constants.CapturePriority.DP_PRIORITY_EXCLUSIVE);
-                }
-
-                if (result != Constants.ResultCode.DP_SUCCESS)
-                {
-                    Logger.Error($"Failed to open reader: {result}");
-                    OnError?.Invoke("open_failed", $"Could not open reader: {result}");
-                    return;
-                }
-
-                _currentReader = reader;
-                var desc = reader.Description;
-                _currentDeviceId = desc.SerialNumber ?? desc.Name;
-
-                Logger.Info($"Reader opened: {desc.Name} (SN: {desc.SerialNumber})");
-                OnDeviceConnected?.Invoke(_currentDeviceId, desc.Name);
-
-                // Subscribe to async capture callback and start capturing
-                _currentReader.On_Captured += OnCapturedCallback;
-                ArmCapture();
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"OpenAndCapture error: {ex.Message}");
-                OnError?.Invoke("open_error", ex.Message);
-            }
+            Logger.Info("Device poll thread exiting");
         }
 
         /// <summary>
-        /// Arms the reader for async capture. When a finger is placed,
-        /// OnCapturedCallback fires automatically.
+        /// Scans for new readers and opens any that are not already active.
+        /// Entire scan is under _sdkLock to prevent overlap with Dispose calls.
         /// </summary>
-        private void ArmCapture()
+        private void ScanAndOpenNewReaders()
         {
-            if (_currentReader == null) return;
+            lock (_sdkLock)
+            {
+                ReaderCollection readers;
+                try
+                {
+                    readers = ReaderCollection.GetReaders();
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"GetReaders error: {ex.Message}");
+                    return;
+                }
 
-            try
-            {
-                _capturing = true;
-                _currentReader.CaptureAsync(
-                    Constants.Formats.Fid.ANSI,
-                    Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
-                    _currentReader.Capabilities.Resolutions[0]
-                );
-                Logger.Info("Capture armed — waiting for finger...");
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"ArmCapture error: {ex.Message}");
-                _capturing = false;
-                HandleDeviceDisconnect();
+                if (readers.Count == 0)
+                    return;
+
+                foreach (var reader in readers)
+                {
+                    string deviceId;
+                    string deviceName;
+                    try
+                    {
+                        var desc = reader.Description;
+                        deviceId = desc.SerialNumber ?? desc.Name;
+                        deviceName = desc.Name;
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"Error reading reader description: {ex.Message}");
+                        continue;
+                    }
+
+                    // Already tracking this reader
+                    if (_activeReaders.ContainsKey(deviceId))
+                        continue;
+
+                    // Try to open
+                    try
+                    {
+                        Logger.Info($"Opening reader: {deviceName} ({deviceId})...");
+
+                        var result = reader.Open(Constants.CapturePriority.DP_PRIORITY_COOPERATIVE);
+                        if (result != Constants.ResultCode.DP_SUCCESS)
+                        {
+                            Logger.Warn($"Cooperative open failed ({result}), trying exclusive...");
+                            result = reader.Open(Constants.CapturePriority.DP_PRIORITY_EXCLUSIVE);
+                        }
+
+                        if (result != Constants.ResultCode.DP_SUCCESS)
+                        {
+                            Logger.Error($"Failed to open reader {deviceId}: {result}");
+                            OnError?.Invoke("open_failed", $"Could not open reader {deviceName}: {result}");
+                            continue;
+                        }
+
+                        var state = new ReaderState
+                        {
+                            Reader = reader,
+                            DeviceId = deviceId,
+                            DeviceName = deviceName
+                        };
+
+                        if (!_activeReaders.TryAdd(deviceId, state))
+                        {
+                            // Race: another thread added it already (shouldn't happen, but safe)
+                            try { reader.Dispose(); } catch { }
+                            continue;
+                        }
+
+                        Logger.Info($"Reader opened: {deviceName} (ID: {deviceId})");
+                        OnDeviceConnected?.Invoke(deviceId, deviceName);
+
+                        // Start capture thread (released from _sdkLock — Capture() runs lock-free)
+                        var cts = new CancellationTokenSource();
+                        state.CaptureCts = cts;
+                        state.CaptureThread = new Thread(() => CaptureLoop(state, cts.Token))
+                        {
+                            Name = $"FP-Capture-{deviceId}",
+                            IsBackground = true
+                        };
+                        state.CaptureThread.Start();
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"Error opening reader {deviceId}: {ex.Message}");
+                        OnError?.Invoke("open_error", $"{deviceName}: {ex.Message}");
+                    }
+                }
             }
         }
 
+        // ── Per-reader capture loop ─────────────────────────────────────
+
         /// <summary>
-        /// SDK callback — fires on the SDK's internal thread whenever a
-        /// capture completes (finger placed) or fails.
+        /// Dedicated capture thread for one reader. Blocks on Capture() without
+        /// holding any locks. On disconnect or fatal error, removes itself from
+        /// _activeReaders, disposes the reader, and exits.
         /// </summary>
-        private void OnCapturedCallback(CaptureResult captureResult)
+        private void CaptureLoop(ReaderState state, CancellationToken ct)
         {
+            var deviceId = state.DeviceId;
+            var deviceName = state.DeviceName;
+            Logger.Info($"[{deviceId}] Capture loop started for {deviceName}");
+            state.Capturing = true;
+
             try
             {
-                if (_currentReader == null)
-                    return;
-
-                Logger.Info($"Captured: ResultCode={captureResult.ResultCode}, Quality={captureResult.Quality}");
-
-                // Cancelled (we called CancelCapture)
-                if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
+                while (!ct.IsCancellationRequested)
                 {
-                    Logger.Info("Capture was cancelled");
-                    _capturing = false;
-                    return;
+                    CaptureResult captureResult;
+
+                    try
+                    {
+                        Logger.Debug($"[{deviceId}] Waiting for finger...");
+
+                        // ── Blocking call — NO lock held ──
+                        captureResult = state.Reader.Capture(
+                            Constants.Formats.Fid.ANSI,
+                            Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
+                            state.Reader.Capabilities.Resolutions[0],
+                            -1  // infinite timeout
+                        );
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                        // Reader was disposed (USB unplug or Stop())
+                        Logger.Warn($"[{deviceId}] Reader disposed during capture");
+                        break;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Catch-all for unexpected SDK errors during capture
+                        Logger.Error($"[{deviceId}] Capture() threw: {ex.GetType().Name}: {ex.Message}");
+
+                        if (IsDeviceGoneException(ex))
+                            break;
+
+                        OnCaptureFailed?.Invoke(deviceId, "capture_exception", ex.Message);
+                        Thread.Sleep(200); // Avoid tight error loops
+                        continue;
+                    }
+
+                    if (ct.IsCancellationRequested)
+                        break;
+
+                    // ── Process result ──
+                    try
+                    {
+                        Logger.Info($"[{deviceId}] Capture: Code={captureResult.ResultCode}, Quality={captureResult.Quality}");
+
+                        // Cancelled (CancelCapture was called)
+                        if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
+                        {
+                            Logger.Info($"[{deviceId}] Capture cancelled");
+                            break;
+                        }
+
+                        // Device failure — reader likely unplugged
+                        if (captureResult.ResultCode == Constants.ResultCode.DP_DEVICE_FAILURE ||
+                            captureResult.ResultCode == Constants.ResultCode.DP_INVALID_DEVICE)
+                        {
+                            Logger.Warn($"[{deviceId}] Device failure: {captureResult.ResultCode}");
+                            break;
+                        }
+
+                        // Non-success (bad scan quality, etc.)
+                        if (captureResult.ResultCode != Constants.ResultCode.DP_SUCCESS)
+                        {
+                            Logger.Warn($"[{deviceId}] Capture non-success: {captureResult.ResultCode}");
+                            OnCaptureFailed?.Invoke(
+                                deviceId,
+                                captureResult.ResultCode.ToString(),
+                                $"Capture failed: {captureResult.ResultCode}"
+                            );
+                            Thread.Sleep(50);
+                            continue;
+                        }
+
+                        // No image data
+                        if (captureResult.Data == null || captureResult.Data.Views.Count == 0)
+                        {
+                            Logger.Warn($"[{deviceId}] Capture returned no image data");
+                            OnCaptureFailed?.Invoke(deviceId, "no_data", "Capture returned no image data");
+                            Thread.Sleep(50);
+                            continue;
+                        }
+
+                        // ════ Successful capture ════
+                        var view = captureResult.Data.Views[0];
+                        int width = view.Width;
+                        int height = view.Height;
+                        int resolution = state.Reader.Capabilities.Resolutions[0];
+                        int quality = MapCaptureQuality(captureResult.Quality);
+
+                        Logger.Info($"[{deviceId}] Fingerprint: {width}x{height} @ {resolution}dpi, quality={quality}");
+
+                        string imageBase64;
+                        if (_captureFormat == "png")
+                        {
+                            imageBase64 = ConvertRawToPngBase64(view.RawImage, width, height);
+                        }
+                        else
+                        {
+                            imageBase64 = Convert.ToBase64String(view.RawImage);
+                        }
+
+                        OnCaptureCompleted?.Invoke(deviceId, imageBase64, quality, width, height, resolution);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Error($"[{deviceId}] Error processing capture result: {ex.GetType().Name}: {ex.Message}");
+                        OnCaptureFailed?.Invoke(deviceId, "process_error", ex.Message);
+                    }
+
+                    Thread.Sleep(50); // Brief pause before re-arming
                 }
-
-                // Reader error — likely unplugged
-                if (captureResult.ResultCode == Constants.ResultCode.DP_DEVICE_FAILURE ||
-                    captureResult.ResultCode == Constants.ResultCode.DP_INVALID_DEVICE)
-                {
-                    Logger.Warn($"Reader error: {captureResult.ResultCode}");
-                    HandleDeviceDisconnect();
-                    return;
-                }
-
-                // Non-success capture
-                if (captureResult.ResultCode != Constants.ResultCode.DP_SUCCESS)
-                {
-                    OnCaptureFailed?.Invoke(
-                        captureResult.ResultCode.ToString(),
-                        $"Capture failed: {captureResult.ResultCode}"
-                    );
-                    // Re-arm for next capture
-                    ArmCapture();
-                    return;
-                }
-
-                // No image data
-                if (captureResult.Data == null || captureResult.Data.Views.Count == 0)
-                {
-                    OnCaptureFailed?.Invoke("no_data", "Capture returned no image data");
-                    ArmCapture();
-                    return;
-                }
-
-                // === Successful capture ===
-                var view = captureResult.Data.Views[0];
-                int width = view.Width;
-                int height = view.Height;
-                int resolution = _currentReader!.Capabilities.Resolutions[0];
-                int quality = MapCaptureQuality(captureResult.Quality);
-
-                Logger.Info($"Fingerprint: {width}x{height} @ {resolution}dpi, quality={quality}");
-
-                string imageBase64;
-                if (_captureFormat == "png")
-                {
-                    imageBase64 = ConvertRawToPngBase64(view.RawImage, width, height);
-                }
-                else
-                {
-                    imageBase64 = Convert.ToBase64String(view.RawImage);
-                }
-
-                OnCaptureCompleted?.Invoke(imageBase64, quality, width, height, resolution);
-            }
-            catch (Exception ex)
-            {
-                Logger.Error($"OnCapturedCallback error: {ex.GetType().Name}: {ex.Message}");
-                OnCaptureFailed?.Invoke("capture_exception", ex.Message);
             }
             finally
             {
-                // Always re-arm for the next capture (unless disconnected)
-                if (_currentReader != null && _capturing)
+                state.Capturing = false;
+                CleanupReader(state);
+                Logger.Info($"[{deviceId}] Capture loop exited");
+            }
+        }
+
+        // ── Cleanup ─────────────────────────────────────────────────────
+
+        /// <summary>
+        /// Removes the reader from tracking, disposes it under _sdkLock,
+        /// and fires OnDeviceDisconnected. Safe to call from any thread.
+        /// </summary>
+        private void CleanupReader(ReaderState state)
+        {
+            var deviceId = state.DeviceId;
+
+            // Remove from dictionary first (so poll thread doesn't see it as active)
+            _activeReaders.TryRemove(deviceId, out _);
+
+            // Dispose under SDK lock
+            lock (_sdkLock)
+            {
+                try { state.Reader.Dispose(); }
+                catch (Exception ex)
                 {
-                    try
-                    {
-                        Thread.Sleep(50); // Brief pause
-                        ArmCapture();
-                    }
-                    catch { }
+                    Logger.Debug($"[{deviceId}] Dispose error (safe to ignore): {ex.Message}");
                 }
             }
+
+            OnDeviceDisconnected?.Invoke(deviceId);
         }
 
-        private void StopCapturing()
+        /// <summary>
+        /// Heuristic: does this exception look like the USB device was yanked?
+        /// </summary>
+        private static bool IsDeviceGoneException(Exception ex)
         {
-            _capturing = false;
-            try { _currentReader?.CancelCapture(); } catch { }
+            var msg = ex.Message.ToLowerInvariant();
+            return msg.Contains("device") ||
+                   msg.Contains("disposed") ||
+                   msg.Contains("handle") ||
+                   msg.Contains("disconnected") ||
+                   msg.Contains("removed") ||
+                   ex is ObjectDisposedException;
         }
 
-        private void CloseCurrentReader()
-        {
-            if (_currentReader != null)
-            {
-                try { _currentReader.On_Captured -= OnCapturedCallback; } catch { }
-                try { _currentReader.Dispose(); } catch { }
-                _currentReader = null;
-                _currentDeviceId = null;
-            }
-        }
-
-        private void HandleDeviceDisconnect()
-        {
-            _capturing = false;
-            CloseCurrentReader();
-            OnDeviceDisconnected?.Invoke();
-        }
+        // ── Helpers ─────────────────────────────────────────────────────
 
         private static int MapCaptureQuality(Constants.CaptureQuality q)
         {

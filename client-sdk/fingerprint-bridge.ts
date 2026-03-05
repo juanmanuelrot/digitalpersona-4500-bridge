@@ -27,6 +27,7 @@ export interface DeviceInfo {
 }
 
 export interface CaptureData {
+  deviceId: string;      // Which reader produced this capture
   imageData: string;     // Base64-encoded image (raw grayscale or PNG)
   quality: number;       // NFIQ score: 1 (best) to 5 (unusable)
   imageWidth: number;
@@ -37,7 +38,7 @@ export interface CaptureData {
 export interface StatusData {
   deviceConnected: boolean;
   capturing: boolean;
-  deviceId?: string;
+  devices?: DeviceInfo[];
 }
 
 export interface ErrorData {
@@ -188,11 +189,6 @@ export class FingerprintBridge {
     this.send({ command: 'get_devices' });
   }
 
-  /** Select a specific fingerprint reader by its device ID */
-  selectDevice(deviceId: string): void {
-    this.send({ command: 'select_device', deviceId });
-  }
-
   /**
    * Set the image format for captures.
    * @param format - 'raw' (grayscale bytes) or 'png' (PNG-encoded)
@@ -231,6 +227,7 @@ export class FingerprintBridge {
       const onCapture = (data: BridgeEvent) => {
         cleanup();
         resolve({
+          deviceId: data.deviceId!,
           imageData: data.imageData!,
           quality: data.quality!,
           imageWidth: data.imageWidth!,

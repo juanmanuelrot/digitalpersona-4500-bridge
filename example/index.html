@@ -116,7 +116,7 @@
 
     .log-entry { display: flex; gap: 8px; }
     .log-time { color: var(--muted); white-space: nowrap; }
-    .log-event { color: var(--info); font-weight: 600; min-width: 140px; }
+    .log-event { color: var(--info); font-weight: 600; min-width: 160px; }
     .log-data { color: var(--text); word-break: break-all; }
     .log-entry.error .log-event { color: var(--danger); }
     .log-entry.success .log-event { color: var(--accent); }
@@ -140,12 +140,34 @@
       background: rgba(34,197,94,0.15); color: var(--accent);
       font-size: 0.6875rem; font-weight: 600; letter-spacing: 0.05em;
     }
+
+    .device-tag {
+      display: inline-block; padding: 2px 6px; border-radius: 4px;
+      background: rgba(59,130,246,0.15); color: var(--info);
+      font-size: 0.6875rem; font-weight: 600; font-family: monospace;
+    }
+
+    .reader-list {
+      display: flex; flex-direction: column; gap: 6px; margin-top: 8px;
+    }
+
+    .reader-item {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 10px; border-radius: 6px;
+      background: rgba(34,197,94,0.08); border: 1px solid rgba(34,197,94,0.2);
+      font-size: 0.8125rem;
+    }
+    .reader-item .reader-dot {
+      width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex-shrink: 0;
+    }
+    .reader-item .reader-name { flex: 1; }
+    .reader-item .reader-id { color: var(--muted); font-family: monospace; font-size: 0.75rem; }
   </style>
 </head>
 <body>
 
   <h1>Fingerprint Bridge — Test Console</h1>
-  <p class="subtitle">Auto-captures whenever a finger is placed on the reader. Just connect and go.</p>
+  <p class="subtitle">Multi-reader auto-capture. All connected readers capture independently.</p>
 
   <div class="grid">
 
@@ -160,13 +182,10 @@
 
       <div class="status-row">
         <div class="status-dot" id="deviceDot"></div>
-        <span class="status-label" id="deviceStatus">No reader detected</span>
+        <span class="status-label" id="deviceStatus">No readers detected</span>
       </div>
 
-      <dl class="info-grid" id="deviceInfo" style="margin-top:12px; display:none;">
-        <dt>Device ID</dt>  <dd id="infoDeviceId">—</dd>
-        <dt>Name</dt>       <dd id="infoDeviceName">—</dd>
-      </dl>
+      <div id="readerList" class="reader-list" style="display:none;"></div>
 
       <div class="btn-row">
         <button id="btnConnect" class="primary" onclick="doConnect()">Connect</button>
@@ -191,11 +210,12 @@
 
       <div class="fingerprint-area">
         <div class="fingerprint-canvas-wrapper" id="fpWrapper">
-          <p class="placeholder-text" id="fpPlaceholder">Waiting for finger...<br>Place your finger on the reader.</p>
+          <p class="placeholder-text" id="fpPlaceholder">Waiting for finger...<br>Place your finger on any reader.</p>
           <img id="fpImage" style="display:none;" alt="Fingerprint">
         </div>
 
         <div class="capture-info" id="captureInfo" style="display:none;">
+          <span class="device-tag" id="captureDeviceId"></span>&nbsp;
           Quality: <span class="quality" id="qualityScore">—</span>
           &nbsp;&middot;&nbsp;
           <span id="dimensionsText">—</span>
@@ -233,6 +253,9 @@
     let captureCount = 0;
     let lastImageDataUrl = null;
 
+    // Track connected readers: Map<deviceId, deviceName>
+    const connectedReaders = new Map();
+
     const PORT = 27015;
 
     // ==========================================================
@@ -243,13 +266,14 @@
     const $wsStatus     = $('wsStatus');
     const $deviceDot    = $('deviceDot');
     const $deviceStatus = $('deviceStatus');
-    const $deviceInfo   = $('deviceInfo');
+    const $readerList   = $('readerList');
     const $fpWrapper    = $('fpWrapper');
     const $fpPlaceholder= $('fpPlaceholder');
     const $fpImage      = $('fpImage');
     const $captureInfo  = $('captureInfo');
     const $captureCount = $('captureCount');
     const $qualityScore = $('qualityScore');
+    const $captureDevId = $('captureDeviceId');
     const $dimensions   = $('dimensionsText');
     const $dpi          = $('dpiText');
     const $log          = $('log');
@@ -284,11 +308,13 @@
 
       ws.onclose = () => {
         isConnected = false;
+        connectedReaders.clear();
         $wsDot.className = 'status-dot';
         $wsStatus.textContent = 'Disconnected';
         $deviceDot.className = 'status-dot';
-        $deviceStatus.textContent = 'No reader detected';
-        $deviceInfo.style.display = 'none';
+        $deviceStatus.textContent = 'No readers detected';
+        $readerList.style.display = 'none';
+        $readerList.innerHTML = '';
         updateButtons();
         log('warn', 'disconnected', 'WebSocket closed');
       };
@@ -319,7 +345,6 @@
     function onFormatChange() {
       const format = $('formatSelect').value;
       sendCmd('set_format', { format });
-      log('info', 'set_format', format);
     }
 
     // ==========================================================
@@ -330,46 +355,38 @@
 
       switch (evt) {
         case 'device_connected':
-          $deviceDot.className = 'status-dot connected';
-          $deviceStatus.textContent = `Connected: ${data.deviceName || data.deviceId}`;
-          $deviceInfo.style.display = 'grid';
-          $('infoDeviceId').textContent = data.deviceId || '—';
-          $('infoDeviceName').textContent = data.deviceName || '—';
-          updateButtons();
+          connectedReaders.set(data.deviceId, data.deviceName || data.deviceId);
+          updateReaderDisplay();
           log('success', evt, `${data.deviceName} (${data.deviceId})`);
           break;
 
         case 'device_disconnected':
-          $deviceDot.className = 'status-dot';
-          $deviceStatus.textContent = 'Reader disconnected';
-          $deviceInfo.style.display = 'none';
-          updateButtons();
-          log('warn', evt, '');
+          connectedReaders.delete(data.deviceId);
+          updateReaderDisplay();
+          log('warn', evt, data.deviceId || '');
           break;
 
         case 'capture_completed':
           captureCount++;
           $captureCount.textContent = captureCount;
           displayFingerprint(data);
-          log('success', evt, `quality=${data.quality}  ${data.imageWidth}x${data.imageHeight}  ${data.imageResolution}dpi  data=${(data.imageData||'').length} chars`);
+          log('success', evt, `[${data.deviceId}] quality=${data.quality}  ${data.imageWidth}x${data.imageHeight}  ${data.imageResolution}dpi  data=${(data.imageData||'').length} chars`);
           break;
 
         case 'capture_failed':
-          log('error', evt, `${data.errorCode}: ${data.errorMessage}`);
+          log('error', evt, `[${data.deviceId}] ${data.errorCode}: ${data.errorMessage}`);
           break;
 
         case 'status':
-          if (data.deviceConnected) {
-            $deviceDot.className = 'status-dot connected';
-            $deviceStatus.textContent = 'Reader connected';
-            $deviceInfo.style.display = 'grid';
-            $('infoDeviceId').textContent = data.deviceId || '—';
-          } else {
-            $deviceDot.className = 'status-dot';
-            $deviceStatus.textContent = 'No reader detected';
+          // Update reader list from status devices array
+          if (data.devices && data.devices.length > 0) {
+            connectedReaders.clear();
+            data.devices.forEach(d => connectedReaders.set(d.id, d.name || d.id));
+          } else if (!data.deviceConnected) {
+            connectedReaders.clear();
           }
-          updateButtons();
-          log('info', evt, `device=${data.deviceConnected} capturing=${data.capturing}`);
+          updateReaderDisplay();
+          log('info', evt, `readers=${connectedReaders.size} capturing=${data.capturing}`);
           break;
 
         case 'device_list':
@@ -387,16 +404,44 @@
     }
 
     // ==========================================================
+    //  Reader display
+    // ==========================================================
+    function updateReaderDisplay() {
+      const count = connectedReaders.size;
+
+      if (count === 0) {
+        $deviceDot.className = 'status-dot';
+        $deviceStatus.textContent = 'No readers detected';
+        $readerList.style.display = 'none';
+        $readerList.innerHTML = '';
+      } else {
+        $deviceDot.className = 'status-dot connected';
+        $deviceStatus.textContent = `${count} reader${count > 1 ? 's' : ''} connected`;
+        $readerList.style.display = 'flex';
+        $readerList.innerHTML = '';
+        connectedReaders.forEach((name, id) => {
+          const item = document.createElement('div');
+          item.className = 'reader-item';
+          item.innerHTML =
+            `<span class="reader-dot"></span>` +
+            `<span class="reader-name">${escHtml(name)}</span>` +
+            `<span class="reader-id">${escHtml(id)}</span>`;
+          $readerList.appendChild(item);
+        });
+      }
+
+      updateButtons();
+    }
+
+    // ==========================================================
     //  Fingerprint display
     // ==========================================================
     function displayFingerprint(data) {
       let dataUrl;
 
       if (data.imageData && data.imageData.startsWith('iVBOR')) {
-        // PNG data (base64-encoded PNG starts with iVBOR)
         dataUrl = `data:image/png;base64,${data.imageData}`;
       } else {
-        // Raw grayscale -> canvas -> data URL
         dataUrl = rawToDataUrl(data.imageData, data.imageWidth, data.imageHeight);
       }
 
@@ -407,6 +452,7 @@
       $fpWrapper.classList.add('has-image');
 
       $captureInfo.style.display = 'block';
+      $captureDevId.textContent = data.deviceId || '?';
       $qualityScore.textContent = `${data.quality}/5 — ${qualityLabel(data.quality)}`;
       $qualityScore.className = `quality quality-${data.quality}`;
       $dimensions.textContent = `${data.imageWidth} x ${data.imageHeight} px`;

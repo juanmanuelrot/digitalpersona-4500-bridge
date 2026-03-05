@@ -5,7 +5,7 @@ A Windows tray application that bridges DigitalPersona 4500 fingerprint readers 
 ## Architecture
 
 ```
-DigitalPersona 4500 USB Reader
+DigitalPersona 4500 USB Reader(s)
          ↓
    Windows HID/WinUSB Driver
          ↓
@@ -22,7 +22,9 @@ DigitalPersona 4500 USB Reader
 
 ## How It Works
 
-The bridge **auto-captures continuously**. As soon as a reader is connected, every finger press is captured and broadcast to all connected WebSocket clients. There are no start/stop capture commands — the frontend simply listens for `capture_completed` events and decides what to do with the data.
+The bridge **auto-captures continuously on all connected readers**. Each reader gets its own dedicated capture thread. Every finger press is captured and broadcast to all connected WebSocket clients with the `deviceId` that produced it. There are no start/stop capture commands — the frontend simply listens for `capture_completed` events and decides what to do with the data.
+
+Readers can be hot-plugged: the bridge detects new readers every 2 seconds and starts capturing immediately. If a reader is unplugged, the bridge cleans up and fires a `device_disconnected` event.
 
 ## Quick Start
 
@@ -67,21 +69,23 @@ import { FingerprintBridge } from './fingerprint-bridge';
 
 const bridge = new FingerprintBridge();
 
-// Listen for events
+// Listen for events — each capture includes the deviceId
 bridge.on('device_connected', (data) => {
-  console.log('Reader connected:', data.deviceName);
+  console.log('Reader connected:', data.deviceName, data.deviceId);
 });
 
 bridge.on('capture_completed', (data) => {
-  console.log(`Quality: ${data.quality}/5`);
+  console.log(`[${data.deviceId}] Quality: ${data.quality}/5`);
   // Display the fingerprint (auto-detects raw vs PNG format)
   const img = document.getElementById('fingerprint') as HTMLImageElement;
   img.src = FingerprintBridge.toDataUrl(data.imageData!, data.imageWidth!, data.imageHeight!);
 });
 
-bridge.on('device_disconnected', () => console.log('Reader unplugged'));
+bridge.on('device_disconnected', (data) => {
+  console.log('Reader unplugged:', data.deviceId);
+});
 
-// Connect — captures start automatically when a reader is present
+// Connect — captures start automatically on all connected readers
 await bridge.connect();
 
 // Optionally switch to PNG format (default is raw grayscale)
@@ -89,6 +93,7 @@ bridge.setFormat('png');
 
 // Or wait for a single capture with a promise
 const result = await bridge.waitForCapture();
+console.log(result.deviceId, result.quality);
 ```
 
 ## WebSocket Protocol
@@ -97,9 +102,8 @@ const result = await bridge.waitForCapture();
 
 | Command | Fields | Description |
 |---------|--------|-------------|
-| `get_status` | | Get current status |
+| `get_status` | | Get current status of all readers |
 | `get_devices` | | List connected readers |
-| `select_device` | `deviceId: string` | Select a specific reader |
 | `set_format` | `format: "raw"\|"png"` | Set capture image format |
 
 ### Events (Bridge → Frontend)
@@ -107,10 +111,10 @@ const result = await bridge.waitForCapture();
 | Event | Key Fields | Description |
 |-------|-----------|-------------|
 | `device_connected` | `deviceId`, `deviceName` | Reader plugged in |
-| `device_disconnected` | | Reader unplugged |
-| `capture_completed` | `imageData`, `quality`, `imageWidth`, `imageHeight`, `imageResolution` | Fingerprint captured |
-| `capture_failed` | `errorCode`, `errorMessage` | Capture error |
-| `status` | `deviceConnected`, `capturing`, `deviceId` | Status response |
+| `device_disconnected` | `deviceId` | Reader unplugged |
+| `capture_completed` | `deviceId`, `imageData`, `quality`, `imageWidth`, `imageHeight`, `imageResolution` | Fingerprint captured |
+| `capture_failed` | `deviceId`, `errorCode`, `errorMessage` | Capture error |
+| `status` | `deviceConnected`, `capturing`, `devices[]` | Status response |
 | `device_list` | `devices[]` | List of readers |
 | `error` | `errorCode`, `errorMessage` | General error |
 

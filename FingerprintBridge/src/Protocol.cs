@@ -9,7 +9,7 @@ namespace FingerprintBridge.Protocol
     {
         /// <summary>
         /// The command to execute.
-        /// Values: "get_status", "get_devices", "select_device", "set_format"
+        /// Values: "get_status", "get_devices", "set_format"
         /// </summary>
         public string? Command { get; set; }
 
@@ -18,11 +18,6 @@ namespace FingerprintBridge.Protocol
         /// Used with "set_format" command.
         /// </summary>
         public string? Format { get; set; }
-
-        /// <summary>
-        /// Device identifier for "select_device" command.
-        /// </summary>
-        public string? DeviceId { get; set; }
     }
 
     /// <summary>
@@ -79,9 +74,6 @@ namespace FingerprintBridge.Protocol
 
         /// <summary>Whether capture is currently active</summary>
         public bool? Capturing { get; set; }
-
-        /// <summary>Device status string from the SDK</summary>
-        public string? ReaderStatus { get; set; }
 
         // --- Errors ---
 
