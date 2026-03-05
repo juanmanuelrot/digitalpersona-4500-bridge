@@ -20,6 +20,10 @@ DigitalPersona 4500 USB Reader
 
 **No Chrome device permission prompts. No DP Lite Client. No repair loops.**
 
+## How It Works
+
+The bridge **auto-captures continuously**. As soon as a reader is connected, every finger press is captured and broadcast to all connected WebSocket clients. There are no start/stop capture commands — the frontend simply listens for `capture_completed` events and decides what to do with the data.
+
 ## Quick Start
 
 ### Prerequisites
@@ -33,8 +37,6 @@ DigitalPersona 4500 USB Reader
 
 ```bat
 cd FingerprintBridge
-mkdir lib
-copy "C:\Program Files\DigitalPersona\Bin\DotNetApi\DPUruNet.dll" lib\
 build.bat
 ```
 
@@ -72,20 +74,21 @@ bridge.on('device_connected', (data) => {
 
 bridge.on('capture_completed', (data) => {
   console.log(`Quality: ${data.quality}/5`);
-  // Display the fingerprint
+  // Display the fingerprint (auto-detects raw vs PNG format)
   const img = document.getElementById('fingerprint') as HTMLImageElement;
-  img.src = FingerprintBridge.rawToDataUrl(data.imageData!, data.imageWidth!, data.imageHeight!);
+  img.src = FingerprintBridge.toDataUrl(data.imageData!, data.imageWidth!, data.imageHeight!);
 });
 
-bridge.on('finger_detected', () => console.log('Finger placed on reader'));
-bridge.on('finger_removed', () => console.log('Finger removed'));
+bridge.on('device_disconnected', () => console.log('Reader unplugged'));
 
-// Connect and start
+// Connect — captures start automatically when a reader is present
 await bridge.connect();
-bridge.startCapture('raw');
 
-// Or capture a single fingerprint
-const result = await bridge.captureOnce('png');
+// Optionally switch to PNG format (default is raw grayscale)
+bridge.setFormat('png');
+
+// Or wait for a single capture with a promise
+const result = await bridge.waitForCapture();
 ```
 
 ## WebSocket Protocol
@@ -94,11 +97,10 @@ const result = await bridge.captureOnce('png');
 
 | Command | Fields | Description |
 |---------|--------|-------------|
-| `start_capture` | `format?: "raw"\|"png"`, `timeout?: number` | Start continuous capture |
-| `stop_capture` | | Stop capturing |
 | `get_status` | | Get current status |
 | `get_devices` | | List connected readers |
 | `select_device` | `deviceId: string` | Select a specific reader |
+| `set_format` | `format: "raw"\|"png"` | Set capture image format |
 
 ### Events (Bridge → Frontend)
 
@@ -106,13 +108,9 @@ const result = await bridge.captureOnce('png');
 |-------|-----------|-------------|
 | `device_connected` | `deviceId`, `deviceName` | Reader plugged in |
 | `device_disconnected` | | Reader unplugged |
-| `reader_ready` | | Reader ready for capture |
-| `capture_started` | | Capture mode active |
-| `finger_detected` | | Finger placed on sensor |
 | `capture_completed` | `imageData`, `quality`, `imageWidth`, `imageHeight`, `imageResolution` | Fingerprint captured |
 | `capture_failed` | `errorCode`, `errorMessage` | Capture error |
-| `finger_removed` | | Finger lifted from sensor |
-| `status` | `deviceConnected`, `capturing`, `readerStatus` | Status response |
+| `status` | `deviceConnected`, `capturing`, `deviceId` | Status response |
 | `device_list` | `devices[]` | List of readers |
 | `error` | `errorCode`, `errorMessage` | General error |
 

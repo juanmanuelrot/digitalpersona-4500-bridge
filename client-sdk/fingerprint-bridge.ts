@@ -4,13 +4,16 @@
  * TypeScript client library for communicating with the Fingerprint Bridge
  * WebSocket service running on localhost.
  *
+ * The bridge auto-captures continuously — every finger press is broadcast.
+ * The frontend decides what to do with the data.
+ *
  * Usage:
  *   const bridge = new FingerprintBridge();
  *   bridge.on('capture_completed', (data) => {
  *     console.log('Fingerprint captured!', data.quality, data.imageData);
  *   });
  *   await bridge.connect();
- *   await bridge.startCapture();
+ *   // That's it! Captures arrive automatically when a finger is placed.
  */
 
 // ---------- Types ----------
@@ -35,7 +38,6 @@ export interface StatusData {
   deviceConnected: boolean;
   capturing: boolean;
   deviceId?: string;
-  readerStatus?: string;
 }
 
 export interface ErrorData {
@@ -58,13 +60,12 @@ export interface BridgeEvent {
   // Status
   deviceConnected?: boolean;
   capturing?: boolean;
-  readerStatus?: string;
   // Error
   errorCode?: string;
   errorMessage?: string;
 }
 
-export type CaptureFormat = 'raw' | 'png' | 'intermediate';
+export type CaptureFormat = 'raw' | 'png';
 
 export interface FingerprintBridgeOptions {
   /** WebSocket port (default: 27015) */
@@ -125,7 +126,7 @@ export class FingerprintBridge {
         resolve();
       };
 
-      this.ws.onclose = (ev) => {
+      this.ws.onclose = () => {
         this._isConnected = false;
         this.emit('disconnected', { event: 'disconnected' });
 
@@ -134,7 +135,7 @@ export class FingerprintBridge {
         }
       };
 
-      this.ws.onerror = (ev) => {
+      this.ws.onerror = () => {
         if (!this._isConnected) {
           reject(new Error('WebSocket connection failed. Is Fingerprint Bridge running?'));
         }
@@ -177,23 +178,6 @@ export class FingerprintBridge {
 
   // ---------- Commands ----------
 
-  /**
-   * Start capturing fingerprints.
-   * The reader will continuously capture fingerprints and emit
-   * 'capture_completed' events until stopCapture() is called.
-   *
-   * @param format - Image format: 'raw' (default), 'png', or 'intermediate'
-   * @param timeout - Timeout in ms per capture attempt, -1 for no timeout
-   */
-  startCapture(format: CaptureFormat = 'raw', timeout: number = -1): void {
-    this.send({ command: 'start_capture', format, timeout });
-  }
-
-  /** Stop capturing fingerprints */
-  stopCapture(): void {
-    this.send({ command: 'stop_capture' });
-  }
-
   /** Get current status of the bridge and reader */
   getStatus(): void {
     this.send({ command: 'get_status' });
@@ -207,6 +191,14 @@ export class FingerprintBridge {
   /** Select a specific fingerprint reader by its device ID */
   selectDevice(deviceId: string): void {
     this.send({ command: 'select_device', deviceId });
+  }
+
+  /**
+   * Set the image format for captures.
+   * @param format - 'raw' (grayscale bytes) or 'png' (PNG-encoded)
+   */
+  setFormat(format: CaptureFormat): void {
+    this.send({ command: 'set_format', format });
   }
 
   // ---------- Async command wrappers ----------
@@ -223,20 +215,21 @@ export class FingerprintBridge {
   }
 
   /**
-   * Capture a single fingerprint and return the data.
-   * Starts capture, waits for one result, then stops.
+   * Wait for the next capture and return the data.
+   * Since the bridge auto-captures continuously, this simply waits
+   * for the next 'capture_completed' event.
+   *
+   * @param timeoutMs - Max time to wait in ms (default: 30000)
    */
-  captureOnce(format: CaptureFormat = 'raw', timeoutMs: number = 30000): Promise<CaptureData> {
+  waitForCapture(timeoutMs: number = 30000): Promise<CaptureData> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         cleanup();
-        this.stopCapture();
         reject(new Error('Capture timed out'));
       }, timeoutMs);
 
       const onCapture = (data: BridgeEvent) => {
         cleanup();
-        this.stopCapture();
         resolve({
           imageData: data.imageData!,
           quality: data.quality!,
@@ -248,7 +241,6 @@ export class FingerprintBridge {
 
       const onError = (data: BridgeEvent) => {
         cleanup();
-        this.stopCapture();
         reject(new Error(data.errorMessage ?? 'Capture failed'));
       };
 
@@ -260,7 +252,6 @@ export class FingerprintBridge {
 
       this.on('capture_completed', onCapture);
       this.on('capture_failed', onError);
-      this.startCapture(format);
     });
   }
 
@@ -337,6 +328,17 @@ export class FingerprintBridge {
    */
   static pngToDataUrl(base64Png: string): string {
     return `data:image/png;base64,${base64Png}`;
+  }
+
+  /**
+   * Auto-detect format and return a data URL.
+   * PNG base64 starts with 'iVBOR', raw does not.
+   */
+  static toDataUrl(base64: string, width: number, height: number): string {
+    if (base64.startsWith('iVBOR')) {
+      return FingerprintBridge.pngToDataUrl(base64);
+    }
+    return FingerprintBridge.rawToDataUrl(base64, width, height);
   }
 
   /**

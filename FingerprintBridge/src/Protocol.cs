@@ -9,21 +9,15 @@ namespace FingerprintBridge.Protocol
     {
         /// <summary>
         /// The command to execute.
-        /// Values: "start_capture", "stop_capture", "get_status", "get_devices", "select_device"
+        /// Values: "get_status", "get_devices", "select_device", "set_format"
         /// </summary>
         public string? Command { get; set; }
 
         /// <summary>
-        /// Capture format: "raw" (default), "intermediate", "png"
-        /// Only used with "start_capture" command.
+        /// Capture format: "raw" (default) or "png".
+        /// Used with "set_format" command.
         /// </summary>
         public string? Format { get; set; }
-
-        /// <summary>
-        /// Capture timeout in milliseconds. -1 for no timeout.
-        /// Only used with "start_capture" command.
-        /// </summary>
-        public int? Timeout { get; set; }
 
         /// <summary>
         /// Device identifier for "select_device" command.
@@ -39,8 +33,7 @@ namespace FingerprintBridge.Protocol
         /// <summary>
         /// Event type. Values:
         /// "device_connected", "device_disconnected", "device_list",
-        /// "capture_started", "capture_completed", "capture_failed",
-        /// "finger_detected", "finger_removed", "reader_ready",
+        /// "capture_completed", "capture_failed",
         /// "status", "error"
         /// </summary>
         public string? Event { get; set; }
