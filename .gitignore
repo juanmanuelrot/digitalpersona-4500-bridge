@@ -1,0 +1,28 @@
+# Build outputs
+bin/
+obj/
+publish/
+
+# Installer output
+FingerprintBridge/installer/output/
+
+# DigitalPersona proprietary files (not redistributable)
+# Users must obtain these from the DP Bio SDK 3.6.1
+FingerprintBridge/lib/*.dll
+FingerprintBridge/lib/*.xml
+!FingerprintBridge/lib/.gitkeep
+
+# DP RTE installer prerequisites (~177MB, not redistributable)
+FingerprintBridge/installer/prerequisites/rte_x64/
+
+# IDE / OS
+.vs/
+.vscode/
+*.user
+*.suo
+*.cache
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

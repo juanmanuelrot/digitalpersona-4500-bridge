@@ -1,0 +1,710 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Fingerprint Bridge — Test Console</title>
+  <style>
+    :root {
+      --bg: #0f1117;
+      --card: #1a1d27;
+      --border: #2a2d3a;
+      --text: #e4e4e7;
+      --muted: #71717a;
+      --accent: #22c55e;
+      --accent-dim: #16a34a;
+      --danger: #ef4444;
+      --warn: #f59e0b;
+      --info: #3b82f6;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 24px;
+    }
+
+    h1 {
+      font-size: 1.5rem;
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+
+    .subtitle {
+      color: var(--muted);
+      font-size: 0.875rem;
+      margin-bottom: 24px;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 20px;
+      max-width: 1100px;
+    }
+
+    @media (max-width: 768px) {
+      .grid { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 20px;
+    }
+
+    .card h2 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Connection status */
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+
+    .status-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--danger);
+      flex-shrink: 0;
+    }
+
+    .status-dot.connected { background: var(--accent); }
+    .status-dot.connecting { background: var(--warn); animation: pulse 1s infinite; }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .status-label {
+      font-size: 0.875rem;
+    }
+
+    /* Buttons */
+    .btn-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 12px;
+    }
+
+    button {
+      padding: 8px 16px;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: var(--card);
+      color: var(--text);
+      font-size: 0.8125rem;
+      cursor: pointer;
+      transition: all 0.15s;
+      font-family: inherit;
+    }
+
+    button:hover { background: var(--border); }
+    button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    button.primary {
+      background: var(--accent);
+      color: #000;
+      border-color: var(--accent);
+      font-weight: 600;
+    }
+
+    button.primary:hover { background: var(--accent-dim); }
+
+    button.danger {
+      background: transparent;
+      color: var(--danger);
+      border-color: var(--danger);
+    }
+
+    button.danger:hover { background: rgba(239, 68, 68, 0.1); }
+
+    /* Fingerprint display */
+    .fingerprint-area {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .fingerprint-canvas-wrapper {
+      width: 220px;
+      height: 280px;
+      border: 2px dashed var(--border);
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      overflow: hidden;
+      background: #000;
+      position: relative;
+    }
+
+    .fingerprint-canvas-wrapper.has-image {
+      border-style: solid;
+      border-color: var(--accent);
+    }
+
+    .fingerprint-canvas-wrapper img {
+      max-width: 100%;
+      max-height: 100%;
+      image-rendering: pixelated;
+    }
+
+    .placeholder-text {
+      color: var(--muted);
+      font-size: 0.8125rem;
+      text-align: center;
+      padding: 20px;
+    }
+
+    .capture-info {
+      font-size: 0.8125rem;
+      color: var(--muted);
+      text-align: center;
+    }
+
+    .capture-info .quality {
+      font-weight: 600;
+      font-size: 1rem;
+    }
+
+    .quality-1 { color: var(--accent); }
+    .quality-2 { color: #4ade80; }
+    .quality-3 { color: var(--warn); }
+    .quality-4 { color: #f97316; }
+    .quality-5 { color: var(--danger); }
+
+    /* Event log */
+    .log-container {
+      grid-column: 1 / -1;
+    }
+
+    .log {
+      font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+      font-size: 0.75rem;
+      line-height: 1.6;
+      max-height: 300px;
+      overflow-y: auto;
+      background: #000;
+      border-radius: 8px;
+      padding: 12px;
+      border: 1px solid var(--border);
+    }
+
+    .log-entry {
+      display: flex;
+      gap: 8px;
+    }
+
+    .log-time { color: var(--muted); white-space: nowrap; }
+    .log-event { color: var(--info); font-weight: 600; min-width: 140px; }
+    .log-data { color: var(--text); word-break: break-all; }
+
+    .log-entry.error .log-event { color: var(--danger); }
+    .log-entry.success .log-event { color: var(--accent); }
+    .log-entry.warn .log-event { color: var(--warn); }
+
+    /* Device info */
+    .info-grid {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: 4px 12px;
+      font-size: 0.8125rem;
+    }
+
+    .info-grid dt { color: var(--muted); }
+    .info-grid dd { color: var(--text); }
+
+    .capture-counter {
+      font-size: 2rem;
+      font-weight: 700;
+      color: var(--accent);
+      text-align: center;
+    }
+
+    .format-select {
+      padding: 6px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 0.8125rem;
+      font-family: inherit;
+    }
+
+    .header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+    }
+  </style>
+</head>
+<body>
+
+  <h1>🔐 Fingerprint Bridge — Test Console</h1>
+  <p class="subtitle">Open this page while FingerprintBridge.exe is running to test the WebSocket connection and fingerprint capture.</p>
+
+  <div class="grid">
+
+    <!-- Connection Card -->
+    <div class="card">
+      <h2>⚡ Connection</h2>
+
+      <div class="status-row">
+        <div class="status-dot" id="wsDot"></div>
+        <span class="status-label" id="wsStatus">Disconnected</span>
+      </div>
+
+      <div class="status-row">
+        <div class="status-dot" id="deviceDot"></div>
+        <span class="status-label" id="deviceStatus">No reader detected</span>
+      </div>
+
+      <dl class="info-grid" id="deviceInfo" style="margin-top:12px; display:none;">
+        <dt>Device ID</dt>  <dd id="infoDeviceId">—</dd>
+        <dt>Name</dt>       <dd id="infoDeviceName">—</dd>
+        <dt>Status</dt>     <dd id="infoReaderStatus">—</dd>
+      </dl>
+
+      <div class="btn-row">
+        <button id="btnConnect" class="primary" onclick="doConnect()">Connect</button>
+        <button id="btnDisconnect" class="danger" onclick="doDisconnect()" disabled>Disconnect</button>
+        <button id="btnGetStatus" onclick="sendCmd('get_status')" disabled>Get Status</button>
+        <button id="btnGetDevices" onclick="sendCmd('get_devices')" disabled>List Devices</button>
+      </div>
+    </div>
+
+    <!-- Fingerprint Display Card -->
+    <div class="card">
+      <div class="header-row">
+        <h2 style="margin-bottom:0;">👆 Fingerprint Capture</h2>
+        <div style="display:flex;align-items:center;gap:8px;">
+          <label for="formatSelect" style="font-size:0.75rem;color:var(--muted);">Format:</label>
+          <select id="formatSelect" class="format-select">
+            <option value="raw">Raw</option>
+            <option value="png">PNG</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="fingerprint-area">
+        <div class="fingerprint-canvas-wrapper" id="fpWrapper">
+          <p class="placeholder-text" id="fpPlaceholder">No capture yet.<br>Click "Start Capture" and place your finger on the reader.</p>
+          <img id="fpImage" style="display:none;" alt="Fingerprint">
+        </div>
+
+        <div class="capture-info" id="captureInfo" style="display:none;">
+          Quality: <span class="quality" id="qualityScore">—</span>
+          &nbsp;·&nbsp;
+          <span id="dimensionsText">—</span>
+          &nbsp;·&nbsp;
+          <span id="dpiText">—</span>
+        </div>
+
+        <div class="capture-counter" id="captureCounter" style="display:none;">
+          <span id="captureCount">0</span> <span style="font-size:0.875rem;font-weight:400;color:var(--muted);">captures</span>
+        </div>
+      </div>
+
+      <div class="btn-row" style="justify-content:center; margin-top:8px;">
+        <button id="btnStartCapture" class="primary" onclick="doStartCapture()" disabled>Start Capture</button>
+        <button id="btnStopCapture" class="danger" onclick="doStopCapture()" disabled>Stop Capture</button>
+        <button id="btnCaptureOnce" onclick="doCaptureOnce()" disabled>Capture Once</button>
+        <button id="btnDownload" onclick="downloadImage()" disabled style="font-size:0.75rem;">💾 Save PNG</button>
+      </div>
+    </div>
+
+    <!-- Event Log -->
+    <div class="card log-container">
+      <div class="header-row">
+        <h2 style="margin-bottom:0;">📋 Event Log</h2>
+        <button onclick="clearLog()" style="font-size:0.75rem;">Clear</button>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+
+  </div>
+
+  <script>
+    // ==========================================================
+    //  State
+    // ==========================================================
+    let ws = null;
+    let isConnected = false;
+    let isCapturing = false;
+    let captureCount = 0;
+    let lastImageDataUrl = null;
+
+    const PORT = 27015;
+
+    // ==========================================================
+    //  DOM refs
+    // ==========================================================
+    const $wsDot          = document.getElementById('wsDot');
+    const $wsStatus       = document.getElementById('wsStatus');
+    const $deviceDot      = document.getElementById('deviceDot');
+    const $deviceStatus   = document.getElementById('deviceStatus');
+    const $deviceInfo     = document.getElementById('deviceInfo');
+    const $fpWrapper      = document.getElementById('fpWrapper');
+    const $fpPlaceholder  = document.getElementById('fpPlaceholder');
+    const $fpImage        = document.getElementById('fpImage');
+    const $captureInfo    = document.getElementById('captureInfo');
+    const $captureCounter = document.getElementById('captureCounter');
+    const $captureCount   = document.getElementById('captureCount');
+    const $qualityScore   = document.getElementById('qualityScore');
+    const $dimensions     = document.getElementById('dimensionsText');
+    const $dpi            = document.getElementById('dpiText');
+    const $log            = document.getElementById('log');
+
+    // Buttons
+    const $btnConnect      = document.getElementById('btnConnect');
+    const $btnDisconnect   = document.getElementById('btnDisconnect');
+    const $btnGetStatus    = document.getElementById('btnGetStatus');
+    const $btnGetDevices   = document.getElementById('btnGetDevices');
+    const $btnStartCapture = document.getElementById('btnStartCapture');
+    const $btnStopCapture  = document.getElementById('btnStopCapture');
+    const $btnCaptureOnce  = document.getElementById('btnCaptureOnce');
+    const $btnDownload     = document.getElementById('btnDownload');
+
+    // ==========================================================
+    //  Connection
+    // ==========================================================
+    function doConnect() {
+      if (ws && ws.readyState === WebSocket.OPEN) return;
+
+      $wsDot.className = 'status-dot connecting';
+      $wsStatus.textContent = 'Connecting...';
+      log('info', 'connecting', `ws://127.0.0.1:${PORT}/`);
+
+      try {
+        ws = new WebSocket(`ws://127.0.0.1:${PORT}/`);
+      } catch (e) {
+        log('error', 'connect_failed', e.message);
+        $wsDot.className = 'status-dot';
+        $wsStatus.textContent = 'Connection failed';
+        return;
+      }
+
+      ws.onopen = () => {
+        isConnected = true;
+        $wsDot.className = 'status-dot connected';
+        $wsStatus.textContent = 'Connected';
+        updateButtons();
+        log('success', 'connected', `WebSocket open on port ${PORT}`);
+
+        // Auto-request status
+        sendCmd('get_status');
+      };
+
+      ws.onclose = () => {
+        isConnected = false;
+        isCapturing = false;
+        $wsDot.className = 'status-dot';
+        $wsStatus.textContent = 'Disconnected';
+        $deviceDot.className = 'status-dot';
+        $deviceStatus.textContent = 'No reader detected';
+        $deviceInfo.style.display = 'none';
+        updateButtons();
+        log('warn', 'disconnected', 'WebSocket closed');
+      };
+
+      ws.onerror = () => {
+        log('error', 'ws_error', 'Connection error — is FingerprintBridge.exe running?');
+      };
+
+      ws.onmessage = (ev) => {
+        let data;
+        try { data = JSON.parse(ev.data); }
+        catch { log('error', 'parse_error', ev.data); return; }
+
+        handleEvent(data);
+      };
+    }
+
+    function doDisconnect() {
+      if (ws) {
+        ws.close();
+        ws = null;
+      }
+    }
+
+    function sendCmd(command, extra = {}) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const msg = { command, ...extra };
+      ws.send(JSON.stringify(msg));
+      log('info', `→ ${command}`, JSON.stringify(extra) !== '{}' ? JSON.stringify(extra) : '');
+    }
+
+    // ==========================================================
+    //  Capture controls
+    // ==========================================================
+    function doStartCapture() {
+      const format = document.getElementById('formatSelect').value;
+      captureCount = 0;
+      $captureCount.textContent = '0';
+      $captureCounter.style.display = 'block';
+      isCapturing = true;
+      updateButtons();
+      sendCmd('start_capture', { format });
+    }
+
+    function doStopCapture() {
+      isCapturing = false;
+      updateButtons();
+      sendCmd('stop_capture');
+    }
+
+    function doCaptureOnce() {
+      const format = document.getElementById('formatSelect').value;
+      captureCount = 0;
+      $captureCount.textContent = '0';
+      $captureCounter.style.display = 'block';
+
+      // Start capture, and stop after first result
+      isCapturing = true;
+      updateButtons();
+      sendCmd('start_capture', { format });
+
+      // We'll stop in the capture_completed handler
+      window._captureOnceMode = true;
+    }
+
+    // ==========================================================
+    //  Event handling
+    // ==========================================================
+    function handleEvent(data) {
+      const evt = data.event;
+
+      switch (evt) {
+        case 'device_connected':
+          $deviceDot.className = 'status-dot connected';
+          $deviceStatus.textContent = `Connected: ${data.deviceName || data.deviceId}`;
+          $deviceInfo.style.display = 'grid';
+          document.getElementById('infoDeviceId').textContent = data.deviceId || '—';
+          document.getElementById('infoDeviceName').textContent = data.deviceName || '—';
+          updateButtons();
+          log('success', evt, `${data.deviceName} (${data.deviceId})`);
+          break;
+
+        case 'device_disconnected':
+          $deviceDot.className = 'status-dot';
+          $deviceStatus.textContent = 'Reader disconnected';
+          $deviceInfo.style.display = 'none';
+          isCapturing = false;
+          updateButtons();
+          log('warn', evt, '');
+          break;
+
+        case 'reader_ready':
+          document.getElementById('infoReaderStatus').textContent = 'Ready';
+          log('success', evt, 'Reader is ready for capture');
+          break;
+
+        case 'capture_started':
+          log('info', evt, 'Waiting for finger...');
+          break;
+
+        case 'finger_detected':
+          log('info', evt, 'Finger detected on sensor');
+          break;
+
+        case 'finger_removed':
+          log('info', evt, 'Finger removed');
+          break;
+
+        case 'capture_completed':
+          captureCount++;
+          $captureCount.textContent = captureCount;
+          displayFingerprint(data);
+          log('success', evt, `quality=${data.quality}  ${data.imageWidth}×${data.imageHeight}  ${data.imageResolution}dpi  data=${(data.imageData||'').length} chars`);
+
+          // If in "capture once" mode, stop after first result
+          if (window._captureOnceMode) {
+            window._captureOnceMode = false;
+            setTimeout(() => doStopCapture(), 100);
+          }
+          break;
+
+        case 'capture_failed':
+          log('error', evt, `${data.errorCode}: ${data.errorMessage}`);
+          break;
+
+        case 'status':
+          if (data.deviceConnected) {
+            $deviceDot.className = 'status-dot connected';
+            $deviceStatus.textContent = 'Reader connected';
+            $deviceInfo.style.display = 'grid';
+            document.getElementById('infoDeviceId').textContent = data.deviceId || '—';
+            document.getElementById('infoReaderStatus').textContent = data.readerStatus || '—';
+          } else {
+            $deviceDot.className = 'status-dot';
+            $deviceStatus.textContent = 'No reader detected';
+          }
+          isCapturing = data.capturing || false;
+          updateButtons();
+          log('info', evt, `device=${data.deviceConnected} capturing=${data.capturing} reader=${data.readerStatus}`);
+          break;
+
+        case 'device_list':
+          const devs = data.devices || [];
+          log('info', evt, `${devs.length} device(s): ${devs.map(d => d.name || d.id).join(', ') || 'none'}`);
+          break;
+
+        case 'error':
+          log('error', evt, `${data.errorCode}: ${data.errorMessage}`);
+          break;
+
+        default:
+          log('info', evt, JSON.stringify(data));
+      }
+    }
+
+    // ==========================================================
+    //  Fingerprint display
+    // ==========================================================
+    function displayFingerprint(data) {
+      const format = document.getElementById('formatSelect').value;
+      let dataUrl;
+
+      if (format === 'png') {
+        dataUrl = `data:image/png;base64,${data.imageData}`;
+      } else {
+        // Raw grayscale → canvas → data URL
+        dataUrl = rawToDataUrl(data.imageData, data.imageWidth, data.imageHeight);
+      }
+
+      lastImageDataUrl = dataUrl;
+      $fpImage.src = dataUrl;
+      $fpImage.style.display = 'block';
+      $fpPlaceholder.style.display = 'none';
+      $fpWrapper.classList.add('has-image');
+
+      // Quality display
+      $captureInfo.style.display = 'block';
+      $qualityScore.textContent = `${data.quality}/5 — ${qualityLabel(data.quality)}`;
+      $qualityScore.className = `quality quality-${data.quality}`;
+      $dimensions.textContent = `${data.imageWidth} × ${data.imageHeight} px`;
+      $dpi.textContent = `${data.imageResolution} DPI`;
+
+      $btnDownload.disabled = false;
+    }
+
+    function rawToDataUrl(base64Raw, width, height) {
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+
+      const raw = Uint8Array.from(atob(base64Raw), c => c.charCodeAt(0));
+      const img = ctx.createImageData(width, height);
+
+      for (let i = 0; i < raw.length; i++) {
+        const v = raw[i];
+        const o = i * 4;
+        img.data[o]     = v;   // R
+        img.data[o + 1] = v;   // G
+        img.data[o + 2] = v;   // B
+        img.data[o + 3] = 255; // A
+      }
+
+      ctx.putImageData(img, 0, 0);
+      return canvas.toDataURL('image/png');
+    }
+
+    function qualityLabel(q) {
+      return { 1: 'Excellent', 2: 'Good', 3: 'Fair', 4: 'Poor', 5: 'Unusable' }[q] || 'Unknown';
+    }
+
+    function downloadImage() {
+      if (!lastImageDataUrl) return;
+      const a = document.createElement('a');
+      a.href = lastImageDataUrl;
+      a.download = `fingerprint_${Date.now()}.png`;
+      a.click();
+    }
+
+    // ==========================================================
+    //  Event log
+    // ==========================================================
+    function log(type, event, detail) {
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${type}`;
+
+      const time = new Date().toLocaleTimeString('en-US', { hour12: false, fractionalSecondDigits: 3 });
+
+      entry.innerHTML =
+        `<span class="log-time">${time}</span>` +
+        `<span class="log-event">${escHtml(event)}</span>` +
+        `<span class="log-data">${escHtml(detail)}</span>`;
+
+      $log.appendChild(entry);
+      $log.scrollTop = $log.scrollHeight;
+    }
+
+    function clearLog() {
+      $log.innerHTML = '';
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;');
+    }
+
+    // ==========================================================
+    //  UI state
+    // ==========================================================
+    function updateButtons() {
+      const deviceReady = isConnected; // commands are valid as long as WS is connected
+
+      $btnConnect.disabled      = isConnected;
+      $btnDisconnect.disabled   = !isConnected;
+      $btnGetStatus.disabled    = !isConnected;
+      $btnGetDevices.disabled   = !isConnected;
+      $btnStartCapture.disabled = !deviceReady || isCapturing;
+      $btnStopCapture.disabled  = !isCapturing;
+      $btnCaptureOnce.disabled  = !deviceReady || isCapturing;
+    }
+
+    // ==========================================================
+    //  Health check on load
+    // ==========================================================
+    async function checkHealth() {
+      try {
+        const r = await fetch(`http://127.0.0.1:${PORT}/health`, { signal: AbortSignal.timeout(2000) });
+        if (r.ok) {
+          const d = await r.json();
+          log('success', 'health_check', `Service is running (${d.clients || 0} clients connected)`);
+          // Auto-connect
+          doConnect();
+        }
+      } catch {
+        log('warn', 'health_check', 'Service not reachable — start FingerprintBridge.exe and click Connect');
+      }
+    }
+
+    // Start
+    checkHealth();
+  </script>
+
+</body>
+</html>

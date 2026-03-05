@@ -1,0 +1,43 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <PublishSingleFile>true</PublishSingleFile>
+    <SelfContained>true</SelfContained>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <AssemblyName>FingerprintBridge</AssemblyName>
+    <RootNamespace>FingerprintBridge</RootNamespace>
+    <ApplicationIcon>assets\fingerprint.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Company>FingerprintBridge</Company>
+    <Product>Fingerprint Bridge Service</Product>
+    <Description>WebSocket bridge for DigitalPersona fingerprint readers</Description>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- DigitalPersona .NET 8 SDK wrapper (managed) -->
+    <Reference Include="DPUruNet">
+      <HintPath>lib\DPUruNet.dll</HintPath>
+      <Private>true</Private>
+    </Reference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      Native DP SDK DLLs required at runtime.
+      These are loaded by DPUruNet.dll via P/Invoke.
+      They must be in the same directory as the exe at runtime.
+    -->
+    <None Include="lib\dpfpdd.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="lib\dpfj.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    <None Include="lib\dpfpdd5000.dll" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="assets\fingerprint.ico" />
+  </ItemGroup>
+
+</Project>
