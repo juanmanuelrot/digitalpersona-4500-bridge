@@ -351,12 +351,12 @@ namespace FingerprintBridge
                         // ── Blocking call — NO lock held ──
                         // Uses cached resolution from Open() — never touches Capabilities here.
                         // SDK signature: Capture(format, processing, timeout, resolution)
-                        //   timeout  = -1 means block indefinitely until finger or CancelCapture()
+                        //   timeout  = 5000ms — returns DP_QUALITY_TIMED_OUT if no finger, loop retries
                         //   resolution = cached DPI from reader capabilities (typically 500)
                         captureResult = state.Reader.Capture(
                             Constants.Formats.Fid.ANSI,
                             Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
-                            -1,               // timeout: infinite — loop exits via CancelCapture() or error
+                            5000,             // timeout: 5 seconds, loop retries on DP_QUALITY_TIMED_OUT
                             state.Resolution  // resolution: 500 DPI (cached from Open)
                         );
                     }
