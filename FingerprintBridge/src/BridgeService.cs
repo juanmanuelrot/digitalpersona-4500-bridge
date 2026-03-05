@@ -1,11 +1,13 @@
 using System;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace FingerprintBridge
 {
     /// <summary>
-    /// Core service that coordinates the WebSocket server and fingerprint device manager.
-    /// Can be started from the tray app or from a Windows Service host.
+    /// Core service: wires the fingerprint device manager to the WebSocket server.
+    /// Always captures — every finger press is broadcast to all connected clients.
+    /// Clients can query status and device list.
     /// </summary>
     public class BridgeService
     {
@@ -25,38 +27,30 @@ namespace FingerprintBridge
             _wsServer = new WebSocketServer(port);
             _deviceManager = new FingerprintDeviceManager();
 
-            // Wire device events -> WebSocket broadcasts
+            // Device events → WebSocket broadcasts (fire-and-forget, thread-safe)
             _deviceManager.OnDeviceConnected += (deviceId, deviceName) =>
             {
                 OnStatusChanged?.Invoke($"Reader connected: {deviceName}");
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "device_connected",
                     DeviceId = deviceId,
                     DeviceName = deviceName
-                }).ConfigureAwait(false);
+                });
             };
 
             _deviceManager.OnDeviceDisconnected += () =>
             {
                 OnStatusChanged?.Invoke("Reader disconnected");
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "device_disconnected"
-                }).ConfigureAwait(false);
-            };
-
-            _deviceManager.OnCaptureStarted += () =>
-            {
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
-                {
-                    Event = "capture_started"
-                }).ConfigureAwait(false);
+                });
             };
 
             _deviceManager.OnCaptureCompleted += (imageBase64, quality, width, height, resolution) =>
             {
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "capture_completed",
                     ImageData = imageBase64,
@@ -64,99 +58,73 @@ namespace FingerprintBridge
                     ImageWidth = width,
                     ImageHeight = height,
                     ImageResolution = resolution
-                }).ConfigureAwait(false);
+                });
             };
 
             _deviceManager.OnCaptureFailed += (errorCode, errorMessage) =>
             {
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "capture_failed",
                     ErrorCode = errorCode,
                     ErrorMessage = errorMessage
-                }).ConfigureAwait(false);
-            };
-
-            _deviceManager.OnFingerDetected += () =>
-            {
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
-                {
-                    Event = "finger_detected"
-                }).ConfigureAwait(false);
-            };
-
-            _deviceManager.OnFingerRemoved += () =>
-            {
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
-                {
-                    Event = "finger_removed"
-                }).ConfigureAwait(false);
-            };
-
-            _deviceManager.OnReaderReady += () =>
-            {
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
-                {
-                    Event = "reader_ready"
-                }).ConfigureAwait(false);
+                });
             };
 
             _deviceManager.OnError += (code, message) =>
             {
                 OnStatusChanged?.Invoke($"Error: {message}");
-                _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                _ = BroadcastSafe(new Protocol.OutboundMessage
                 {
                     Event = "error",
                     ErrorCode = code,
                     ErrorMessage = message
-                }).ConfigureAwait(false);
+                });
             };
 
-            // Wire incoming WebSocket commands -> device manager
+            // Incoming WebSocket commands → device manager
             _wsServer.OnCommandReceived += async (command) =>
             {
-                switch (command.Command?.ToLowerInvariant())
+                try
                 {
-                    case "start_capture":
-                        _deviceManager.StartCapture(
-                            command.Format ?? "raw",
-                            command.Timeout ?? -1
-                        );
-                        break;
+                    switch (command.Command?.ToLowerInvariant())
+                    {
+                        case "get_status":
+                            var status = _deviceManager.GetStatus();
+                            await _wsServer.BroadcastAsync(status);
+                            break;
 
-                    case "stop_capture":
-                        _deviceManager.StopCapture();
-                        break;
+                        case "get_devices":
+                            var devices = _deviceManager.GetDevices();
+                            await _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                            {
+                                Event = "device_list",
+                                Devices = devices
+                            });
+                            break;
 
-                    case "get_status":
-                        var status = _deviceManager.GetStatus();
-                        await _wsServer.BroadcastAsync(status);
-                        break;
+                        case "select_device":
+                            if (command.DeviceId != null)
+                                _deviceManager.SelectDevice(command.DeviceId);
+                            break;
 
-                    case "get_devices":
-                        var devices = _deviceManager.GetDevices();
-                        await _wsServer.BroadcastAsync(new Protocol.OutboundMessage
-                        {
-                            Event = "device_list",
-                            Devices = devices
-                        });
-                        break;
+                        case "set_format":
+                            _deviceManager.SetFormat(command.Format ?? "raw");
+                            break;
 
-                    case "select_device":
-                        if (command.DeviceId != null)
-                        {
-                            _deviceManager.SelectDevice(command.DeviceId);
-                        }
-                        break;
-
-                    default:
-                        await _wsServer.BroadcastAsync(new Protocol.OutboundMessage
-                        {
-                            Event = "error",
-                            ErrorCode = "unknown_command",
-                            ErrorMessage = $"Unknown command: {command.Command}"
-                        });
-                        break;
+                        default:
+                            await _wsServer.BroadcastAsync(new Protocol.OutboundMessage
+                            {
+                                Event = "error",
+                                ErrorCode = "unknown_command",
+                                ErrorMessage = $"Unknown command: {command.Command}"
+                            });
+                            break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Logger.Error($"Command handler error: {ex.Message}");
                 }
             };
         }
@@ -189,6 +157,22 @@ namespace FingerprintBridge
             IsRunning = false;
             OnStatusChanged?.Invoke("Stopped");
             Logger.Info("Fingerprint Bridge stopped");
+        }
+
+        /// <summary>
+        /// Fire-and-forget broadcast that never throws or deadlocks.
+        /// Safe to call from any thread (SDK callbacks, poll thread, etc.)
+        /// </summary>
+        private async Task BroadcastSafe(Protocol.OutboundMessage msg)
+        {
+            try
+            {
+                await _wsServer.BroadcastAsync(msg).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Logger.Error($"Broadcast error: {ex.Message}");
+            }
         }
     }
 }

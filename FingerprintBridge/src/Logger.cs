@@ -41,12 +41,7 @@ namespace FingerprintBridge
         public static void Info(string message) => Log("INF", message);
         public static void Warn(string message) => Log("WRN", message);
         public static void Error(string message) => Log("ERR", message);
-        public static void Debug(string message)
-        {
-#if DEBUG
-            Log("DBG", message);
-#endif
-        }
+        public static void Debug(string message) => Log("DBG", message);
 
         private static void Log(string level, string message)
         {

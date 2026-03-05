@@ -13,6 +13,7 @@ namespace FingerprintBridge
     {
         private readonly HttpListener _listener;
         private readonly ConcurrentDictionary<string, WebSocket> _clients = new();
+        private readonly SemaphoreSlim _sendLock = new(1, 1);
         private CancellationToken _ct;
         private readonly JsonSerializerOptions _jsonOptions;
 
@@ -215,35 +216,44 @@ namespace FingerprintBridge
             var bytes = Encoding.UTF8.GetBytes(json);
             var segment = new ArraySegment<byte>(bytes);
 
-            var deadClients = new System.Collections.Generic.List<string>();
-
-            foreach (var (id, ws) in _clients)
+            // Serialize all sends — WebSocket.SendAsync is not thread-safe
+            await _sendLock.WaitAsync(_ct).ConfigureAwait(false);
+            try
             {
-                if (ws.State != WebSocketState.Open)
+                var deadClients = new System.Collections.Generic.List<string>();
+
+                foreach (var (id, ws) in _clients)
                 {
-                    deadClients.Add(id);
-                    continue;
+                    if (ws.State != WebSocketState.Open)
+                    {
+                        deadClients.Add(id);
+                        continue;
+                    }
+
+                    try
+                    {
+                        await ws.SendAsync(segment, WebSocketMessageType.Text, true, _ct).ConfigureAwait(false);
+                    }
+                    catch
+                    {
+                        deadClients.Add(id);
+                    }
                 }
 
-                try
+                foreach (var id in deadClients)
                 {
-                    await ws.SendAsync(segment, WebSocketMessageType.Text, true, _ct);
+                    _clients.TryRemove(id, out var deadWs);
+                    try { deadWs?.Dispose(); } catch { }
                 }
-                catch
+
+                if (deadClients.Count > 0)
                 {
-                    deadClients.Add(id);
+                    OnClientCountChanged?.Invoke(ClientCount);
                 }
             }
-
-            foreach (var id in deadClients)
+            finally
             {
-                _clients.TryRemove(id, out var deadWs);
-                try { deadWs?.Dispose(); } catch { }
-            }
-
-            if (deadClients.Count > 0)
-            {
-                OnClientCountChanged?.Invoke(ClientCount);
+                _sendLock.Release();
             }
         }
 
