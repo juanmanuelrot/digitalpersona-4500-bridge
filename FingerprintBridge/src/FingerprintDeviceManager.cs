@@ -385,20 +385,34 @@ namespace FingerprintBridge
 
             try
             {
-                // CaptureAsync returns immediately.
+                var threadState = Thread.CurrentThread.GetApartmentState();
+                var syncCtx = SynchronizationContext.Current;
+                Logger.Info($"[{state.DeviceId}] Arming CaptureAsync (thread={Thread.CurrentThread.Name}, STA={threadState}, SyncCtx={syncCtx?.GetType().Name ?? "null"})");
+
+                // CaptureAsync returns Constants.ResultCode.
                 // The SDK monitors the sensor in the background and fires On_Captured
                 // when a finger is detected (or on error/cancel).
-                state.Reader.CaptureAsync(
+                var armResult = state.Reader.CaptureAsync(
                     Constants.Formats.Fid.ANSI,
                     Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
                     state.Resolution
                 );
+
+                Logger.Info($"[{state.DeviceId}] CaptureAsync returned: {armResult}");
+
+                if (armResult != Constants.ResultCode.DP_SUCCESS)
+                {
+                    Logger.Error($"[{state.DeviceId}] CaptureAsync FAILED: {armResult}");
+                    state.CaptureArmed = false;
+                    return;
+                }
+
                 state.CaptureArmed = true;
                 Logger.Info($"[{state.DeviceId}] Capture armed, waiting for finger...");
             }
             catch (Exception ex)
             {
-                Logger.Error($"[{state.DeviceId}] CaptureAsync failed: {ex.Message}");
+                Logger.Error($"[{state.DeviceId}] CaptureAsync threw: {ex.GetType().Name}: {ex.Message}");
                 state.CaptureArmed = false;
 
                 // If the device is gone, clean up
