@@ -113,8 +113,15 @@ namespace FingerprintBridge
             {
                 try
                 {
-                    var status = _currentReader.GetStatus();
-                    readerStatus = status.Status.ToString();
+                    var result = _currentReader.GetStatus();
+                    if (result == Constants.ResultCode.DP_SUCCESS)
+                    {
+                        readerStatus = _currentReader.Status.Status.ToString();
+                    }
+                    else
+                    {
+                        readerStatus = "error";
+                    }
                 }
                 catch { readerStatus = "unknown"; }
             }
@@ -205,11 +212,11 @@ namespace FingerprintBridge
                         // Check if current reader is still present
                         try
                         {
-                            var status = _currentReader.GetStatus();
-                            if (status.Status == Constants.ReaderStatuses.DP_STATUS_FAILURE ||
-                                status.Status == Constants.ReaderStatuses.DP_STATUS_NO_DEVICE)
+                            var result = _currentReader.GetStatus();
+                            if (result != Constants.ResultCode.DP_SUCCESS ||
+                                _currentReader.Status.Status == Constants.ReaderStatuses.DP_STATUS_FAILURE)
                             {
-                                Logger.Warn("Reader reported failure/no_device status");
+                                Logger.Warn("Reader reported failure status");
                                 HandleDeviceDisconnect();
                             }
                         }
@@ -291,10 +298,19 @@ namespace FingerprintBridge
                 try
                 {
                     // Check reader status before capture
-                    var status = _currentReader.GetStatus();
-                    if (status.Status != Constants.ReaderStatuses.DP_STATUS_READY)
+                    var statusResult = _currentReader.GetStatus();
+                    if (statusResult != Constants.ResultCode.DP_SUCCESS)
                     {
-                        Logger.Warn($"Reader not ready: {status.Status}. Waiting...");
+                        Logger.Warn($"GetStatus failed: {statusResult}. Waiting...");
+                        Thread.Sleep(500);
+                        continue;
+                    }
+                    var readerStatus = _currentReader.Status.Status;
+                    if (readerStatus == Constants.ReaderStatuses.DP_STATUS_BUSY ||
+                        readerStatus == Constants.ReaderStatuses.DP_STATUS_FAILURE ||
+                        readerStatus == Constants.ReaderStatuses.DP_STATUS_NEED_CALIBRATION)
+                    {
+                        Logger.Warn($"Reader not ready: {readerStatus}. Waiting...");
                         Thread.Sleep(500);
                         continue;
                     }
@@ -325,7 +341,7 @@ namespace FingerprintBridge
                         continue;
                     }
 
-                    if (captureResult.ResultCode == Constants.ResultCode.DP_CAPTURE_CANCELLED)
+                    if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
                     {
                         Logger.Debug("Capture was cancelled");
                         break;
@@ -341,7 +357,7 @@ namespace FingerprintBridge
                         continue;
                     }
 
-                    if (captureResult.Data == null || captureResult.Data.Views.Length == 0)
+                    if (captureResult.Data == null || captureResult.Data.Views.Count == 0)
                     {
                         OnCaptureFailed?.Invoke("no_data", "Capture returned no image data");
                         continue;
