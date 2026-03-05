@@ -8,9 +8,9 @@ FingerprintBridge/installer/output/
 
 # DigitalPersona proprietary files (not redistributable)
 # Users must obtain these from the DP Bio SDK 3.6.1
-FingerprintBridge/lib/*.dll
-FingerprintBridge/lib/*.xml
-!FingerprintBridge/lib/.gitkeep
+#FingerprintBridge/lib/*.dll
+#FingerprintBridge/lib/*.xml
+#!FingerprintBridge/lib/.gitkeep
 
 # DP RTE installer prerequisites (~177MB, not redistributable)
 FingerprintBridge/installer/prerequisites/rte_x64/
