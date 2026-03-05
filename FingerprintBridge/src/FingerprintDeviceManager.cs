@@ -337,6 +337,8 @@ namespace FingerprintBridge
 
             int consecutiveErrors = 0;
             const int MAX_CONSECUTIVE_ERRORS = 5;
+            const int CAPTURE_TIMEOUT_MS = 5000;
+            const int WATCHDOG_MS = CAPTURE_TIMEOUT_MS + 3000; // 8s — safety margin over SDK timeout
 
             try
             {
@@ -346,19 +348,35 @@ namespace FingerprintBridge
 
                     try
                     {
-                        Logger.Debug($"[{deviceId}] Waiting for finger (res={state.Resolution})...");
+                        Logger.Info($"[{deviceId}] Waiting for finger (res={state.Resolution}, timeout={CAPTURE_TIMEOUT_MS}ms)...");
 
-                        // ── Blocking call — NO lock held ──
-                        // Uses cached resolution from Open() — never touches Capabilities here.
-                        // SDK signature: Capture(format, processing, timeout, resolution)
-                        //   timeout  = 5000ms — returns DP_QUALITY_TIMED_OUT if no finger, loop retries
-                        //   resolution = cached DPI from reader capabilities (typically 500)
-                        captureResult = state.Reader.Capture(
-                            Constants.Formats.Fid.ANSI,
-                            Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
-                            5000,             // timeout: 5 seconds, loop retries on DP_QUALITY_TIMED_OUT
-                            state.Resolution  // resolution: 500 DPI (cached from Open)
-                        );
+                        // ── Watchdog timer ──
+                        // The SDK's Capture() sometimes hangs and ignores its own timeout.
+                        // This timer calls CancelCapture() after WATCHDOG_MS to force it out.
+                        // CancelCapture() is safe to call from any thread (SDK-documented).
+                        Timer? watchdog = new Timer(_ =>
+                        {
+                            Logger.Warn($"[{deviceId}] WATCHDOG: Capture() hung past {WATCHDOG_MS}ms, forcing CancelCapture()");
+                            try { state.Reader.CancelCapture(); } catch { }
+                        }, null, WATCHDOG_MS, Timeout.Infinite);
+
+                        try
+                        {
+                            // ── Blocking call — NO lock held ──
+                            // SDK signature: Capture(format, processing, timeout, resolution)
+                            captureResult = state.Reader.Capture(
+                                Constants.Formats.Fid.ANSI,
+                                Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
+                                CAPTURE_TIMEOUT_MS,   // timeout in ms
+                                state.Resolution      // resolution: 500 DPI (cached from Open)
+                            );
+                        }
+                        finally
+                        {
+                            // Always dispose the watchdog — Capture() returned (or threw)
+                            watchdog.Dispose();
+                            watchdog = null;
+                        }
                     }
                     catch (ObjectDisposedException)
                     {
@@ -390,7 +408,7 @@ namespace FingerprintBridge
                     // ── Process result ──
                     try
                     {
-                        Logger.Info($"[{deviceId}] Capture: Code={captureResult.ResultCode}, Quality={captureResult.Quality}");
+                        Logger.Info($"[{deviceId}] Capture returned: Code={captureResult.ResultCode}, Quality={captureResult.Quality}");
 
                         // ── Check ResultCode FIRST (before Quality) ──
 
@@ -420,14 +438,15 @@ namespace FingerprintBridge
 
                         // ── Now check Quality ──
 
-                        // Timed out (5s elapsed, no finger) — just re-loop silently
+                        // Timed out (no finger within timeout period) — re-loop
                         if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_TIMED_OUT)
                         {
+                            Logger.Debug($"[{deviceId}] Timed out (no finger), retrying...");
+                            consecutiveErrors = 0; // Timeouts are normal, reset error count
                             continue;
                         }
 
-                        // Cancelled ONLY when WE called CancelCapture (via Stop/cleanup).
-                        // Only break if token is also cancelled, otherwise it's spurious.
+                        // Cancelled — either our watchdog fired, Stop() called, or spurious
                         if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_CANCELED)
                         {
                             if (ct.IsCancellationRequested)
@@ -436,9 +455,17 @@ namespace FingerprintBridge
                                 break;
                             }
 
-                            // Spurious cancel — retry
-                            Logger.Warn($"[{deviceId}] Spurious cancel, retrying...");
-                            Thread.Sleep(200);
+                            // Watchdog or spurious cancel — count as error and retry
+                            consecutiveErrors++;
+                            Logger.Warn($"[{deviceId}] Capture cancelled unexpectedly (attempt {consecutiveErrors}/{MAX_CONSECUTIVE_ERRORS})");
+
+                            if (consecutiveErrors >= MAX_CONSECUTIVE_ERRORS)
+                            {
+                                Logger.Error($"[{deviceId}] Too many unexpected cancellations, closing reader");
+                                break;
+                            }
+
+                            Thread.Sleep(500);
                             continue;
                         }
 
@@ -472,7 +499,7 @@ namespace FingerprintBridge
                         int height = view.Height;
                         int quality = MapCaptureQuality(captureResult.Quality);
 
-                        Logger.Info($"[{deviceId}] Fingerprint: {width}x{height} @ {state.Resolution}dpi, quality={quality}");
+                        Logger.Info($"[{deviceId}] ✓ Fingerprint: {width}x{height} @ {state.Resolution}dpi, quality={quality}");
 
                         string imageBase64;
                         if (_captureFormat == "png")
