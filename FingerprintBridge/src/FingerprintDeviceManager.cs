@@ -338,11 +338,13 @@ namespace FingerprintBridge
 
                         // ── Blocking call — NO lock held ──
                         // Uses cached resolution from Open() — never touches Capabilities here.
+                        // Timeout = 5 seconds; loop retries until finger placed or cancelled.
+                        // (-1 causes DP_INVALID_PARAMETER on some SDK builds.)
                         captureResult = state.Reader.Capture(
                             Constants.Formats.Fid.ANSI,
                             Constants.CaptureProcessing.DP_IMG_PROC_DEFAULT,
                             state.Resolution,
-                            -1  // infinite timeout
+                            5000  // 5-second timeout, loop retries
                         );
                     }
                     catch (ObjectDisposedException)
@@ -404,6 +406,12 @@ namespace FingerprintBridge
                         }
 
                         // ── Now check Quality ──
+
+                        // Timed out (5s elapsed, no finger) — just re-loop silently
+                        if (captureResult.Quality == Constants.CaptureQuality.DP_QUALITY_TIMED_OUT)
+                        {
+                            continue;
+                        }
 
                         // Cancelled ONLY when WE called CancelCapture (via Stop/cleanup).
                         // Only break if token is also cancelled, otherwise it's spurious.
